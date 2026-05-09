@@ -11,6 +11,20 @@ Claude Code enforces a **rolling 5-hour session limit**. When running automated 
 
 ## How It Works
 
+```mermaid
+flowchart TD
+    A([You run a task in Claude Code]) --> B[Claude Code logs API response<br/>to local JSONL]
+    B --> C[budget_check.py hook<br/>fires before next tool call]
+    C --> D[Scan JSONL +<br/>sum weighted tokens]
+    D --> E{Usage % vs<br/>calibrated limit}
+    E -->|&lt; 80%| F[✓ Proceed silently]
+    E -->|80–93%| G[⟳ Re-sync + log estimate]
+    E -->|≥ 93%| H[⏸ Block dispatch until<br/>5-hour session resets]
+    F --> A
+    G --> A
+    H -.->|wait for reset| A
+```
+
 Claude Code writes every API response to local JSONL files:
 ~/.claude/projects/<project-path>/<session-id>.jsonl
 
