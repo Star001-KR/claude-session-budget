@@ -106,7 +106,31 @@ The PreToolUse hook is wired automatically via [hooks/hooks.json](hooks/hooks.js
 the [skill](skills/budget-check/SKILL.md) becomes available as
 `/session-budget:budget-check`, and all scripts run from `${CLAUDE_PLUGIN_ROOT}/scripts/`.
 
-### Option B — Manual Hook (no plugin)
+### Option B — Homebrew
+
+```bash
+brew tap Star001-KR/claude-session-budget https://github.com/Star001-KR/claude-session-budget
+brew install Star001-KR/claude-session-budget/claude-session-budget
+```
+
+This installs the `budget-check` and `budget-calibrate` commands into
+`$(brew --prefix)/bin`. To wire `budget-check` as a Claude Code PreToolUse
+hook, add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "/opt/homebrew/bin/budget-check"}]
+      }
+    ]
+  }
+}
+```
+
+### Option C — Manual Hook (no plugin, no brew)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main/install.sh | bash
@@ -127,7 +151,7 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-### Option C — Claude Code Skill (manual copy)
+### Option D — Claude Code Skill (manual copy)
 
 ```bash
 mkdir -p .claude/skills/session-budget
@@ -135,7 +159,7 @@ cp skills/budget-check/SKILL.md .claude/skills/session-budget/SKILL.md
 cp scripts/budget_check.py .claude/skills/session-budget/check.py
 ```
 
-### Option D — PM Layer / Orchestrator
+### Option E — PM Layer / Orchestrator
 
 ```python
 import sys; sys.path.insert(0, "scripts")  # or install as a package
@@ -275,6 +299,7 @@ match wins per key, but **process env always overrides**.
 | `tests/test_budget_core.py` | Unit tests (44) — env loading, jsonl scan, anchor, signature matcher, EWMA |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
+| `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |
 | `docs/internals.md` | Architecture deep-dive (anchor + 5h fallback + signature matcher + EWMA) |
 | `LICENSE` | MIT |
 
