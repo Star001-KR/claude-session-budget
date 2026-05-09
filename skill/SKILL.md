@@ -8,7 +8,7 @@ Use when operating in automated or long-running contexts to avoid hitting the 5-
 python3 .claude/skills/session-budget/check.py
 ```
 
-## Thresholds
+## Thresholds (defaults; user-configurable via `.env`)
 
 | Usage | Action |
 |---|---|
@@ -19,4 +19,4 @@ python3 .claude/skills/session-budget/check.py
 ## Note
 
 Reads `~/.claude/projects/**/*.jsonl` locally. No API calls or network requests.
-Default limit: 63,226,913 weighted tokens (Claude Max 5x, measured 2026-05-09).
+Default limit: 63,226,913 weighted tokens (Claude Max 5x, measured 2026-05-09); auto-refined as the tool detects rate-limit events.
