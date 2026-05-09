@@ -14,7 +14,7 @@ import argparse, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _budget_core import (
-    record_observed_pct, scan_window, get_calibrated_limit,
+    record_observed_pct, scan_window, load_calibration,
     CALIBRATION_FILE, EWMA_ALPHA,
 )
 
@@ -31,13 +31,17 @@ if weighted == 0:
     print("ERROR: No usage entries in last 5h. Make sure Claude Code was active.", file=sys.stderr)
     sys.exit(1)
 
-prior = get_calibrated_limit()
+prior_stored = load_calibration().get("limit")
 new_limit = record_observed_pct(args.observed_pct, weighted=weighted)
 
 print(f"\n  Weighted tokens: {weighted:,}")
 print(f"  Observed usage:  {args.observed_pct:.0f}%")
-print(f"  Prior limit:     {prior:,}")
-print(f"  New limit (EWMA α={EWMA_ALPHA}): {new_limit:,}")
+if isinstance(prior_stored, (int, float)) and prior_stored > 0:
+    print(f"  Prior limit:     {int(prior_stored):,}")
+    print(f"  New limit (EWMA α={EWMA_ALPHA}): {new_limit:,}")
+else:
+    print(f"  Prior limit:     none (first calibration — seeding directly)")
+    print(f"  New limit:       {new_limit:,}")
 print(f"\nSaved to {CALIBRATION_FILE}")
 print("Auto-loaded on next run; no env var needed.")
 print("\nKnown baselines:")

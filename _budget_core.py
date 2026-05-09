@@ -111,7 +111,7 @@ def parse_ts(v):
 
 
 _RATE_LIMIT_PATTERNS = [
-    re.compile(r"5-?hour\s+limit", re.I),
+    re.compile(r"5[-\s]?hour\s+limit", re.I),
     re.compile(r"session\s+limit", re.I),
     re.compile(r"rate[_\-\s]?limit", re.I),
     re.compile(r"usage\s+limit\s+reached", re.I),
