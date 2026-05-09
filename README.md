@@ -105,7 +105,7 @@ async def dispatch_task(task):
 | Threshold | Default | Behavior |
 |---|---|---|
 | Sync | 80% | Re-reads JSONL and logs updated estimate |
-| Pause | 93% | Blocks next dispatch; waits until session resets |
+| Pause | 93% | Blocks by default; optional hook sleep mode can wait and re-check |
 
 Set thresholds via env vars **or** a `.env` file (loaded automatically):
 
@@ -124,6 +124,43 @@ Copy `.env.example` to get started:
 ```bash
 cp .env.example ~/.claude/.env
 ```
+
+## Pause Modes
+
+By default, `budget_check.py` blocks immediately when usage reaches the pause
+threshold:
+
+```bash
+BUDGET_PAUSE_MODE=block
+```
+
+You can opt into sleep mode:
+
+```bash
+BUDGET_PAUSE_MODE=sleep
+BUDGET_RECHECK_SECS=60
+BUDGET_RESET_GRACE_SECS=60
+BUDGET_MAX_SLEEP_SECS=14400
+```
+
+In sleep mode, the PreToolUse hook process stays alive, periodically re-checks
+local JSONL usage, and exits `0` once usage falls below the pause threshold.
+This lets the original tool call continue after the 5-hour window has rolled
+forward enough. Before resuming, it sleeps `BUDGET_RESET_GRACE_SECS` and checks
+one more time.
+
+### Important Risks
+
+Sleep mode is experimental and disabled by default.
+
+- The hook process may remain alive for minutes or hours.
+- Claude Code, your shell, terminal, OS, or task runner may impose timeouts.
+- The UI can appear stuck while the hook is sleeping.
+- If the reset estimate is wrong, the hook may still block after waiting.
+- Sleep mode is best for supervised local use, not unattended automation.
+
+For reliable queue pause/resume behavior, prefer `SessionBudgetManager` in an
+orchestrator or PM layer.
 
 ## Limitations
 

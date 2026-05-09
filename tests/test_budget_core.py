@@ -30,6 +30,10 @@ def reload_core(env_overrides):
         "BUDGET_CALIBRATED_LIMIT",
         "BUDGET_SYNC_PCT",
         "BUDGET_PAUSE_PCT",
+        "BUDGET_PAUSE_MODE",
+        "BUDGET_RECHECK_SECS",
+        "BUDGET_RESET_GRACE_SECS",
+        "BUDGET_MAX_SLEEP_SECS",
         "BUDGET_EWMA_ALPHA",
     ]
     for k in keys:
@@ -519,6 +523,37 @@ class ThresholdConstantsTests(unittest.TestCase):
         core = reload_core({"BUDGET_SYNC_PCT": "70", "BUDGET_PAUSE_PCT": "95"})
         self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.70)
         self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.95)
+
+    def test_sleep_mode_defaults_to_block(self):
+        core = reload_core({})
+        self.assertEqual(core.HOOK_PAUSE_MODE, "block")
+        self.assertEqual(core.HOOK_RECHECK_SECS, 60)
+        self.assertEqual(core.HOOK_RESET_GRACE_SECS, 60)
+        self.assertEqual(core.HOOK_MAX_SLEEP_SECS, 14400)
+
+    def test_sleep_mode_picked_from_env(self):
+        core = reload_core({
+            "BUDGET_PAUSE_MODE": "sleep",
+            "BUDGET_RECHECK_SECS": "5",
+            "BUDGET_RESET_GRACE_SECS": "7",
+            "BUDGET_MAX_SLEEP_SECS": "11",
+        })
+        self.assertEqual(core.HOOK_PAUSE_MODE, "sleep")
+        self.assertEqual(core.HOOK_RECHECK_SECS, 5)
+        self.assertEqual(core.HOOK_RESET_GRACE_SECS, 7)
+        self.assertEqual(core.HOOK_MAX_SLEEP_SECS, 11)
+
+    def test_invalid_sleep_mode_config_falls_back(self):
+        core = reload_core({
+            "BUDGET_PAUSE_MODE": "forever",
+            "BUDGET_RECHECK_SECS": "0",
+            "BUDGET_RESET_GRACE_SECS": "-1",
+            "BUDGET_MAX_SLEEP_SECS": "not-a-number",
+        })
+        self.assertEqual(core.HOOK_PAUSE_MODE, "block")
+        self.assertEqual(core.HOOK_RECHECK_SECS, 60)
+        self.assertEqual(core.HOOK_RESET_GRACE_SECS, 60)
+        self.assertEqual(core.HOOK_MAX_SLEEP_SECS, 14400)
 
 
 if __name__ == "__main__":

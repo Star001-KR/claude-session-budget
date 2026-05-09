@@ -50,10 +50,37 @@ DEFAULT_WEIGHTS = {
     "cache_read_input_tokens": 0.10,
 }
 DEFAULT_LIMIT = 63_226_913
-EWMA_ALPHA = float(os.environ.get("BUDGET_EWMA_ALPHA", "0.3"))
 
-THRESHOLD_SYNC = float(os.environ.get("BUDGET_SYNC_PCT", "80")) / 100
-THRESHOLD_PAUSE = float(os.environ.get("BUDGET_PAUSE_PCT", "93")) / 100
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name, default, minimum=None):
+    try:
+        value = int(_env_float(name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    if minimum is not None and value < minimum:
+        return int(default)
+    return value
+
+
+EWMA_ALPHA = _env_float("BUDGET_EWMA_ALPHA", "0.3")
+
+THRESHOLD_SYNC = _env_float("BUDGET_SYNC_PCT", "80") / 100
+THRESHOLD_PAUSE = _env_float("BUDGET_PAUSE_PCT", "93") / 100
+
+HOOK_PAUSE_MODE = os.environ.get("BUDGET_PAUSE_MODE", "block").strip().lower()
+if HOOK_PAUSE_MODE not in ("block", "sleep"):
+    HOOK_PAUSE_MODE = "block"
+
+HOOK_RECHECK_SECS = _env_int("BUDGET_RECHECK_SECS", "60", minimum=1)
+HOOK_RESET_GRACE_SECS = _env_int("BUDGET_RESET_GRACE_SECS", "60", minimum=0)
+HOOK_MAX_SLEEP_SECS = _env_int("BUDGET_MAX_SLEEP_SECS", "14400", minimum=0)
 
 
 def load_calibration():
