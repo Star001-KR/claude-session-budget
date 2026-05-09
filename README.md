@@ -27,11 +27,19 @@ Each assistant message contains token counts in a `usage` field. By summing thes
 
 ### Calibration
 
+The calibrated limit is **auto-learned** as you use Claude Code:
+
+1. Every time `budget_check.py` runs, it scans recent JSONL for rate-limit / 5-hour-limit markers.
+2. When it finds a new event, it takes the weighted token total at that moment as a real-world `100%` reading.
+3. The stored limit is EWMA-merged with the observation (default α=0.3) and written to `~/.claude/.budget_calibration.json`.
+
+You can also seed/refine it manually with one `/usage` reading:
+
 ```bash
 python3 calibrate.py --observed-pct 67
 ```
 
-Known baselines:
+Known baselines (used until auto-learning kicks in):
 - **Claude Max (5x):** ~63,226,913 weighted tokens = 100% (measured 2026-05-09)
 - **Claude Pro:** unknown — contributions welcome
 
@@ -86,8 +94,22 @@ async def dispatch_task(task):
 | Sync | 80% | Re-reads JSONL and logs updated estimate |
 | Pause | 93% | Blocks next dispatch; waits until session resets |
 
+Set thresholds via env vars **or** a `.env` file (loaded automatically):
+
 ```bash
 BUDGET_SYNC_PCT=80 BUDGET_PAUSE_PCT=93 python3 budget_check.py
+```
+
+`.env` lookup order — first hit wins per key, but **process env always overrides**:
+
+1. `./.env` (current working directory — per-project override)
+2. `~/.claude/.env` (global default for all sessions)
+3. Built-in defaults
+
+Copy `.env.example` to get started:
+
+```bash
+cp .env.example ~/.claude/.env
 ```
 
 ## Limitations
@@ -101,9 +123,11 @@ BUDGET_SYNC_PCT=80 BUDGET_PAUSE_PCT=93 python3 budget_check.py
 
 | File | Description |
 |---|---|
-| `budget_check.py` | Lightweight hook script (no deps) |
+| `budget_check.py` | Lightweight hook script (no deps); also runs auto-calibration |
 | `session_budget_manager.py` | Full async class for PM/orchestrator integration |
-| `calibrate.py` | One-time calibration tool |
+| `calibrate.py` | Manual calibration entry from a `/usage` reading |
+| `_budget_core.py` | Shared core: `.env` loader, JSONL scan, EWMA learner |
+| `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line hook installer |
 | `skill/SKILL.md` | Claude Code skill definition |
 
