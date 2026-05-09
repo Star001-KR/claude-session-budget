@@ -123,15 +123,71 @@ def _looks_like_rate_limit(line):
     return any(p.search(line) for p in _RATE_LIMIT_PATTERNS)
 
 
-def scan_window(now=None):
-    """Scan in-window JSONL entries.
+def find_session_anchor(now=None):
+    """Latest 'session start' timestamp from jsonl bridge_status entries.
+
+    Claude Code writes a `type=system, subtype=bridge_status` line whenever
+    /remote-control becomes active — i.e. when a new session attaches to the
+    bridge. That timestamp is a strong (but intermittent) signal of when the
+    current 5h window actually began.
 
     Returns:
-        weighted_total (int), oldest_usage_ts (float), rate_limit_events (list[(ts, weighted_at_event)]).
+        epoch seconds of the most recent in-window bridge_status, or None
+        if no signal is found in the last 5h. Callers should fall back to
+        their own rolling-window estimate when None.
     """
     if now is None:
         now = time.time()
     cutoff = now - WINDOW_SECS
+    latest = None
+    for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(f, errors="ignore") as fh:
+                for line in fh:
+                    if "bridge_status" not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "system" or d.get("subtype") != "bridge_status":
+                        continue
+                    ts = parse_ts(d.get("timestamp"))
+                    if cutoff <= ts <= now and (latest is None or ts > latest):
+                        latest = ts
+        except OSError:
+            continue
+    return latest
+
+
+def scan_window(now=None):
+    """Scan in-window JSONL entries.
+
+    Anchor logic: when a `bridge_status` entry is found within the rolling 5h
+    window, its timestamp is treated as the authoritative session start —
+    cutoff is raised to that point and only newer messages count. When no
+    anchor exists, falls back to the plain 5h rolling window (older behavior).
+
+    Returns:
+        weighted_total (int): sum of weighted usage tokens since cutoff.
+        oldest_usage_ts (float): effective session start ts. Equal to the
+            anchor when one is found; otherwise the earliest in-window usage
+            message ts. Reset time = oldest_usage_ts + WINDOW_SECS.
+        rate_limit_events (list[(ts, weighted_at_event)]).
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - WINDOW_SECS
+
+    anchor = find_session_anchor(now)
+    if anchor is not None and anchor > cutoff:
+        cutoff = anchor
+
     weights = get_weights()
 
     entries = []
@@ -164,12 +220,14 @@ def scan_window(now=None):
     entries.sort(key=lambda e: e[0])
 
     total = 0
-    oldest = now
+    # When we have an authoritative anchor, oldest = anchor regardless of msg ts.
+    # Otherwise, fall back to the earliest in-window usage message.
+    oldest = anchor if anchor is not None else now
     events = []
     for ts, w_inc, rl in entries:
         if w_inc:
             total += w_inc
-            if cutoff < ts < oldest:
+            if anchor is None and cutoff < ts < oldest:
                 oldest = ts
         if rl:
             events.append((ts, total))

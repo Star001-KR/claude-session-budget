@@ -68,6 +68,17 @@ def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0):
     }
 
 
+def bridge_status_entry(ts, content="/remote-control is active"):
+    if isinstance(ts, (int, float)):
+        ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "timestamp": ts,
+        "type": "system",
+        "subtype": "bridge_status",
+        "content": content,
+    }
+
+
 class LoadEnvFileTests(unittest.TestCase):
     def test_loads_quoted_and_unquoted(self):
         with TemporaryDirectory() as tmp:
@@ -414,6 +425,93 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
             with open(cf) as fh:
                 cal = json.load(fh)
             self.assertEqual(len(cal["history"]), 1)  # not duplicated
+
+
+class FindSessionAnchorTests(unittest.TestCase):
+    def _setup(self, tmp, entries):
+        projects = os.path.join(tmp, "p")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "x", "s.jsonl"), entries)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+        })
+
+    def test_returns_none_when_no_bridge_status(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [usage_entry(now - 60, input_=100)])
+            self.assertIsNone(core.find_session_anchor(now=now))
+
+    def test_returns_latest_in_window(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                bridge_status_entry(now - 3000),
+                bridge_status_entry(now - 600),    # latest — should win
+                bridge_status_entry(now - 1800),
+            ])
+            anchor = core.find_session_anchor(now=now)
+            self.assertIsNotNone(anchor)
+            self.assertAlmostEqual(anchor, now - 600, delta=1)
+
+    def test_ignores_out_of_window(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                bridge_status_entry(now - (5 * 3600 + 200)),  # outside window
+                usage_entry(now - 60, input_=100),            # keeps mtime fresh
+            ])
+            self.assertIsNone(core.find_session_anchor(now=now))
+
+
+class ScanWindowAnchorTests(unittest.TestCase):
+    def _setup(self, tmp, entries):
+        projects = os.path.join(tmp, "p")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "x", "s.jsonl"), entries)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+        })
+
+    def test_anchor_used_as_cutoff(self):
+        """Messages before the bridge_status anchor must be excluded."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 7200, input_=100_000),   # pre-anchor: ignored
+                bridge_status_entry(now - 3600),           # anchor
+                usage_entry(now - 1800, input_=10),        # post-anchor: counted
+            ])
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 10)
+            self.assertAlmostEqual(oldest, now - 3600, delta=1)
+
+    def test_no_anchor_falls_back_to_window(self):
+        """Without bridge_status, behavior matches the old rolling-window logic."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 7200, input_=100),
+                usage_entry(now - 1800, input_=10),
+            ])
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 110)
+            # oldest should be the earliest in-window usage msg
+            self.assertAlmostEqual(oldest, now - 7200, delta=1)
+
+    def test_oldest_returns_anchor_even_if_no_post_anchor_usage(self):
+        """If anchor is set but no usage messages after it, oldest = anchor."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 7200, input_=500),       # pre-anchor: ignored
+                bridge_status_entry(now - 60),
+            ])
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 0)
+            self.assertAlmostEqual(oldest, now - 60, delta=1)
 
 
 class ThresholdConstantsTests(unittest.TestCase):
