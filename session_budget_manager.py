@@ -47,10 +47,16 @@ class SessionBudgetManager:
     def get_status(self):
         self._refresh_limit()
         pct, weighted = self._compute()
+        reset_at = self._estimate_reset()
+        remaining = max(reset_at - time.time(), 0)
+        hrs, rem = divmod(int(remaining), 3600)
         return {
             "pct": round(pct * 100, 1),
             "weighted_tokens": weighted,
             "calibrated_limit": self.calibrated_limit,
+            "reset_at": reset_at,
+            "remaining_secs": int(remaining),
+            "remaining_str": "already reset" if remaining == 0 else f"{hrs}h {rem//60}m",
         }
 
     async def check_before_dispatch(self):
