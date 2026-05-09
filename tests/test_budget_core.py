@@ -83,6 +83,26 @@ def bridge_status_entry(ts, content="/remote-control is active"):
     }
 
 
+def api_error_entry(ts, *, status=429, inner_type="rate_limit_error", message="Rate limit exceeded"):
+    """Mirror the shape Claude Code records for an Anthropic API error."""
+    if isinstance(ts, (int, float)):
+        ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "timestamp": ts,
+        "type": "system",
+        "subtype": "api_error",
+        "error": {
+            "status": status,
+            "error": {
+                "type": inner_type,
+                "error": {"type": inner_type, "message": message},
+            },
+            "headers": {},
+            "requestID": "req_test",
+        },
+    }
+
+
 class LoadEnvFileTests(unittest.TestCase):
     def test_loads_quoted_and_unquoted(self):
         with TemporaryDirectory() as tmp:
@@ -150,30 +170,81 @@ class ParseTsTests(unittest.TestCase):
         self.assertEqual(self.core.parse_ts("not a date"), 0.0)
 
 
-class RateLimitPatternTests(unittest.TestCase):
+class RateLimitSignatureTests(unittest.TestCase):
+    """_looks_like_rate_limit() now matches structurally on the parsed dict.
+
+    Match rules: type=system, subtype=api_error, AND either HTTP status 429
+    OR a nested error.type containing 'rate_limit' / 'usage_limit'. We do NOT
+    look at message content text — historically that produced a self-poisoning
+    EWMA loop because user/assistant messages routinely discuss "rate limit"
+    as a topic.
+    """
+
     def setUp(self):
         self.core = reload_core({})
 
-    def test_matches(self):
-        for s in [
-            "5-hour limit reached",
-            "5hour limit",      # no separator
-            "5 hour limit",     # space separator (regression: previously missed)
-            "Session limit hit",
-            "rate-limit",
-            "rate_limit",
-            "Usage limit reached today",
-            "limit reached",
-        ]:
-            self.assertTrue(self.core._looks_like_rate_limit(s), msg=s)
+    # ---------- positive cases (real signature) ----------
 
-    def test_non_matches(self):
-        for s in [
-            "ordinary log line",
-            '{"message": "hello world"}',
-            "limit but not reached",
+    def test_status_429(self):
+        d = api_error_entry("2026-05-09T12:00:00Z", status=429, inner_type="rate_limit_error")
+        self.assertTrue(self.core._looks_like_rate_limit(d))
+
+    def test_inner_type_rate_limit_error(self):
+        d = api_error_entry("2026-05-09T12:00:00Z", status=200, inner_type="rate_limit_error")
+        self.assertTrue(self.core._looks_like_rate_limit(d))
+
+    def test_inner_type_usage_limit_error(self):
+        d = api_error_entry("2026-05-09T12:00:00Z", status=200, inner_type="usage_limit_error")
+        self.assertTrue(self.core._looks_like_rate_limit(d))
+
+    def test_nested_error_type_walks_through_layers(self):
+        d = {
+            "type": "system",
+            "subtype": "api_error",
+            "error": {
+                "status": 200,  # not 429
+                "error": {
+                    "type": "api_error",
+                    "error": {"type": "rate_limit_error", "message": "..."},  # 3rd level
+                },
+            },
+        }
+        self.assertTrue(self.core._looks_like_rate_limit(d))
+
+    # ---------- negative cases (the false-positive class we eliminated) ----------
+
+    def test_assistant_message_with_rate_limit_text(self):
+        """User/assistant messages discussing 'rate limit' must not match."""
+        for body in [
+            "5-hour limit reached",
+            "Session limit hit",
+            "GitHub API rate limit",
+            "rate_limit_error",  # even if the literal type string is in body
         ]:
-            self.assertFalse(self.core._looks_like_rate_limit(s), msg=s)
+            d = {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": body},
+            }
+            self.assertFalse(self.core._looks_like_rate_limit(d), msg=body)
+
+    def test_user_message_with_rate_limit_text(self):
+        d = {
+            "type": "user",
+            "message": {"role": "user", "content": "Why am I getting limit reached?"},
+        }
+        self.assertFalse(self.core._looks_like_rate_limit(d))
+
+    def test_other_api_error_does_not_match(self):
+        d = api_error_entry("2026-05-09T12:00:00Z", status=401, inner_type="authentication_error")
+        self.assertFalse(self.core._looks_like_rate_limit(d))
+
+    def test_system_other_subtype_does_not_match(self):
+        d = {"type": "system", "subtype": "bridge_status", "content": "active"}
+        self.assertFalse(self.core._looks_like_rate_limit(d))
+
+    def test_non_dict_input_returns_false(self):
+        for v in (None, [], "rate_limit_error", 42, ""):
+            self.assertFalse(self.core._looks_like_rate_limit(v), msg=repr(v))
 
 
 class ScanWindowTests(unittest.TestCase):
@@ -211,19 +282,14 @@ class ScanWindowTests(unittest.TestCase):
             self.assertEqual(total, 10)
 
     def test_rate_limit_event_capture(self):
-        # The rate-limit detection runs per-line; we need a real JSON line that
-        # also matches the pattern. Embed the marker into a usage entry so it
-        # sticks both as `weight` AND `rl=True`.
+        """A real api_error entry produces exactly one event with the running weighted total."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             projects = os.path.join(tmp, "projects")
             os.makedirs(projects, exist_ok=True)
             entries = [
                 usage_entry(now - 120, input_=1000),
-                {  # rate-limit error message embedded
-                    "timestamp": datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "message": {"content": "5-hour limit reached, please wait"},
-                },
+                api_error_entry(now - 60, status=429),
             ]
             write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
             core = reload_core({
@@ -236,6 +302,38 @@ class ScanWindowTests(unittest.TestCase):
             ev_ts, weighted_at_event = events[0]
             self.assertAlmostEqual(weighted_at_event, 1000)
             self.assertGreater(ev_ts, now - 121)
+
+    def test_message_body_text_is_not_a_rate_limit_event(self):
+        """Regression guard: user/assistant message text mentioning 'rate limit' /
+        'limit reached' must NOT register as a rate-limit event. This is the
+        false-positive class that previously caused the EWMA self-poisoning loop.
+        """
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            projects = os.path.join(tmp, "projects")
+            os.makedirs(projects, exist_ok=True)
+            chat_iso = datetime.fromtimestamp(now - 30, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            entries = [
+                usage_entry(now - 60, input_=42),
+                {  # assistant message body mentioning the topic
+                    "timestamp": chat_iso,
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": "5-hour limit reached"},
+                },
+                {  # user message body mentioning the topic
+                    "timestamp": chat_iso,
+                    "type": "user",
+                    "message": {"role": "user", "content": "rate_limit_error"},
+                },
+            ]
+            write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+            })
+            total, _, events = core.scan_window(now=now)
+            self.assertEqual(total, 42)
+            self.assertEqual(events, [])  # the key assertion
 
     def test_malformed_json_skipped(self):
         with TemporaryDirectory() as tmp:
@@ -398,10 +496,9 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
     def test_event_triggers_ewma_update(self):
         with TemporaryDirectory() as tmp:
             now = time.time()
-            iso = datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat().replace("+00:00", "Z")
             entries = [
-                usage_entry(now - 120, input_=10_000),  # weight=10000
-                {"timestamp": iso, "message": {"content": "session limit reached"}},
+                usage_entry(now - 120, input_=10_000),    # weight=10000
+                api_error_entry(now - 60, status=429),    # real rate-limit signature
             ]
             core, cf = self._setup(tmp, entries, BUDGET_EWMA_ALPHA=0.5)
             # prior = DEFAULT_LIMIT (no stored calib), observed = 10_000
@@ -417,10 +514,9 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
     def test_repeated_event_is_idempotent(self):
         with TemporaryDirectory() as tmp:
             now = time.time()
-            iso = datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat().replace("+00:00", "Z")
             entries = [
                 usage_entry(now - 120, input_=10_000),
-                {"timestamp": iso, "message": {"content": "5-hour limit reached"}},
+                api_error_entry(now - 60, status=429),
             ]
             core, cf = self._setup(tmp, entries, BUDGET_EWMA_ALPHA=0.5)
             first = core.maybe_update_calibration()

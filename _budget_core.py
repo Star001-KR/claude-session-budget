@@ -8,7 +8,7 @@ Responsibilities:
   - Persist auto-learned calibration to ~/.claude/.budget_calibration.json.
   - Detect rate-limit events in JSONL and EWMA-update the calibrated limit.
 """
-import glob, json, os, re, time
+import glob, json, os, time
 from datetime import datetime
 
 WINDOW_SECS = 5 * 3600
@@ -137,17 +137,40 @@ def parse_ts(v):
     return v / 1000 if v > 1e10 else float(v)
 
 
-_RATE_LIMIT_PATTERNS = [
-    re.compile(r"5[-\s]?hour\s+limit", re.I),
-    re.compile(r"session\s+limit", re.I),
-    re.compile(r"rate[_\-\s]?limit", re.I),
-    re.compile(r"usage\s+limit\s+reached", re.I),
-    re.compile(r"limit\s+reached", re.I),
-]
+def _looks_like_rate_limit(parsed):
+    """Detect a real Anthropic API rate-limit error in a parsed jsonl entry.
 
+    Real signal — Claude Code records API errors as
+    `type=system, subtype=api_error` with the full HTTP response captured
+    under `error`. We match on:
+      - HTTP status 429, OR
+      - any nested `error.type` containing "rate_limit" / "usage_limit".
 
-def _looks_like_rate_limit(line):
-    return any(p.search(line) for p in _RATE_LIMIT_PATTERNS)
+    We deliberately do NOT match on free-text content. User and assistant
+    message bodies routinely discuss "rate limit" / "limit reached" as a
+    topic (e.g. debugging this very tool) and that produced a self-poisoning
+    EWMA learning loop. Structural signature matching eliminates that class
+    of false positive entirely.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("type") != "system" or parsed.get("subtype") != "api_error":
+        return False
+    err = parsed.get("error") or {}
+    if not isinstance(err, dict):
+        return False
+    if err.get("status") == 429:
+        return True
+    # Walk possibly-nested {"error": {"error": {...}}} shapes (Anthropic SDK)
+    cur = err
+    for _ in range(4):
+        if not isinstance(cur, dict):
+            break
+        et = cur.get("type")
+        if isinstance(et, str) and ("rate_limit" in et or "usage_limit" in et):
+            return True
+        cur = cur.get("error")
+    return False
 
 
 def find_session_anchor(now=None):
@@ -238,7 +261,7 @@ def scan_window(now=None):
                     w_inc = 0
                     if u:
                         w_inc = int(sum(u.get(k, 0) * w for k, w in weights.items()))
-                    rl = _looks_like_rate_limit(line)
+                    rl = _looks_like_rate_limit(d)
                     if w_inc or rl:
                         entries.append((ts, w_inc, rl))
         except OSError:
