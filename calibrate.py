@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-\"\"\"
+"""
 One-time calibration: correlates local JSONL token sums with a known /usage percentage.
 
 Usage:
     1. Run /usage inside Claude Code, note 'Current session' percentage
     2. python3 calibrate.py --observed-pct 67
     3. export BUDGET_CALIBRATED_LIMIT=<output>
-\"\"\"
+"""
 import argparse, glob, json, os, sys, time
 from datetime import datetime
 

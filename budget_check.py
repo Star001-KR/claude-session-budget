@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-\"\"\"
+"""
 Claude Code PreToolUse hook: checks 5-hour session usage before every tool call.
 Exit 0 = proceed. Exit 2 = block (session near limit).
 
 Config via env vars:
   BUDGET_CALIBRATED_LIMIT  (default: 63226913 for Max plan)
   BUDGET_PAUSE_PCT         (default: 93)
-\"\"\"
+"""
 import glob, json, os, sys, time
 from datetime import datetime
 
