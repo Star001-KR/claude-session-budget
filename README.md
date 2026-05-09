@@ -16,18 +16,40 @@ Claude Code enforces a **rolling 5-hour session limit**. When running automated 
 flowchart TD
     A([You run a task in Claude Code]) --> B[Claude Code logs API response<br/>to local JSONL]
     B --> C[budget_check.py hook<br/>fires before next tool call]
-    C --> D[Scan JSONL +<br/>sum weighted tokens]
-    D --> E{Usage % vs<br/>calibrated limit}
-    E -->|&lt; 80%| F([✓ Proceed silently])
-    E -->|80–93%| G([⟳ Re-sync + log estimate])
-    E -->|≥ 93%| H[⏸ Block dispatch until<br/>5-hour session resets]
-    H -.->|wait for reset| A
+    C --> D[find_session_anchor:<br/>scan for bridge_status ts]
+    D -->|anchor found| E1[cutoff = anchor ts<br/>only post-anchor msgs count]
+    D -->|no anchor| E2[cutoff = now − 5h<br/>plain rolling window]
+    E1 --> F[Sum weighted tokens after cutoff]
+    E2 --> F
+    F --> G{Usage % vs<br/>calibrated limit}
+    G -->|&lt; 80%| H([✓ Proceed silently])
+    G -->|80–93%| I([⟳ Re-sync + log estimate])
+    G -->|≥ 93%| J[⏸ Block dispatch until<br/>5-hour session resets]
+    J -.->|wait for reset| A
 ```
 
 Claude Code writes every API response to local JSONL files:
 ~/.claude/projects/<project-path>/<session-id>.jsonl
 
 Each assistant message contains token counts in a `usage` field. By summing these with pricing-ratio weights and calibrating against one `/usage` observation, we estimate session usage in real time.
+
+### Session Anchor (`bridge_status`)
+
+A pure 5-hour rolling window over-counts when older sessions linger in jsonl.
+Claude Code records a `type=system, subtype=bridge_status` line whenever
+`/remote-control` activates — a strong signal that a new active session has
+begun.
+
+`find_session_anchor()` looks for the most recent `bridge_status` ts inside
+the rolling 5h window. When found, the scan cutoff is **raised to that ts**
+and only newer messages count toward the budget. The next reset estimate
+becomes `anchor + 5h`, which lines up with Anthropic's `/usage` reset time
+within minutes.
+
+When no anchor is present (idle gaps, tool restarts), the logic falls back to
+the plain 5h rolling window — same behavior as before. The anchor is
+intermittent by design; the fallback keeps the tool useful even when the
+signal is stale.
 
 ### Token Weighting (Opus pricing, input = 1.0)
 
@@ -40,13 +62,26 @@ Each assistant message contains token counts in a `usage` field. By summing thes
 
 ### Calibration
 
-The calibrated limit is **auto-learned** as you use Claude Code:
+The calibrated limit is **auto-learned** from real Anthropic API errors:
 
-1. Every time `budget_check.py` runs, it scans recent JSONL for rate-limit / 5-hour-limit markers.
-2. When it finds a new event, it takes the weighted token total at that moment as a real-world `100%` reading.
-3. The stored limit is EWMA-merged with the observation (default α=0.3) and written to `~/.claude/.budget_calibration.json`.
+1. Every time `budget_check.py` runs, it inspects each in-window jsonl entry
+   for the **structural API-error signature**:
+   `type=system, subtype=api_error` with HTTP `status=429`, or any nested
+   `error.type` containing `rate_limit` / `usage_limit`.
+2. When it finds a new event, it takes the weighted token total at that
+   moment as a real-world `100%` reading.
+3. The stored limit is EWMA-merged with the observation (default α=0.3) and
+   written to `~/.claude/.budget_calibration.json`.
 
-You can also seed/refine it manually with one `/usage` reading:
+> **Why structural matching, not text?**
+> An earlier version regex-matched `"rate limit"` / `"limit reached"` in the
+> raw jsonl line. That picked up *any* user/assistant message body that
+> mentioned the topic — including conversations debugging this very tool —
+> and produced a self-poisoning EWMA loop that drove the calibrated limit
+> from 63M down to 16M, causing false 100% BLOCKING. Structural signature
+> matching eliminates that class of false positive.
+
+You can also seed/refine the limit manually with one `/usage` reading:
 
 ```bash
 python3 calibrate.py --observed-pct 67
@@ -98,6 +133,23 @@ async def dispatch_task(task):
     wait_secs = await budget.check_before_dispatch()
     if wait_secs:
         await asyncio.sleep(wait_secs)
+    # Optional: log current state for dashboards / observability
+    s = budget.get_status()
+    log.info(f"{s['pct']}% — resets in {s['remaining_str']} (epoch={s['reset_at']})")
+```
+
+`get_status()` returns a dict with both raw numbers and a human-friendly
+remaining string:
+
+```python
+{
+  "pct": 13.2,
+  "weighted_tokens": 2_128_235,
+  "calibrated_limit": 63_226_913,
+  "reset_at": 1778355198.018,        # epoch seconds (anchor + 5h, or oldest msg + 5h)
+  "remaining_secs": 16_755,
+  "remaining_str": "4h 39m",         # or "already reset" when remaining == 0
+}
 ```
 
 ## Thresholds
@@ -162,11 +214,36 @@ Sleep mode is experimental and disabled by default.
 For reliable queue pause/resume behavior, prefer `SessionBudgetManager` in an
 orchestrator or PM layer.
 
+## Environment Variables
+
+All variables can be set in process env, `./.env`, or `~/.claude/.env`. First
+match wins per key, but **process env always overrides**.
+
+| Variable | Default | Description |
+|---|---|---|
+| `BUDGET_SYNC_PCT` | `80` | Sync threshold (% of limit). At/above this, hook logs an estimate update |
+| `BUDGET_PAUSE_PCT` | `93` | Pause threshold (% of limit). At/above this, hook blocks (or sleeps) |
+| `BUDGET_PAUSE_MODE` | `block` | `block` → exit 2 immediately. `sleep` → keep hook alive, re-check periodically |
+| `BUDGET_RECHECK_SECS` | `60` | sleep mode: jsonl re-scan interval |
+| `BUDGET_RESET_GRACE_SECS` | `60` | sleep mode: extra wait after threshold drop, before resume |
+| `BUDGET_MAX_SLEEP_SECS` | `14400` | sleep mode cap (4h). After this, hook gives up and exits 2 |
+| `BUDGET_EWMA_ALPHA` | `0.3` | EWMA smoothing factor for auto-learned limit |
+| `BUDGET_CALIBRATED_LIMIT` | *(unset)* | Hard override of stored calibrated limit (weighted tokens) |
+| `BUDGET_PROJECTS_DIR` | `~/.claude/projects` | jsonl scan root |
+| `BUDGET_CALIBRATION_FILE` | `~/.claude/.budget_calibration.json` | Persistence path for auto-calibration |
+
 ## Limitations
 
 - Token weights are a **proxy** — Anthropic's internal formula is not public
 - **Peak hours** (weekday 5–11am PT) consume limits faster
 - **Cross-device usage** is not tracked (JSONL files are local only)
+- The `bridge_status` anchor is **intermittent**: it appears when
+  `/remote-control` activates, not on every tool call. When stale (long idle
+  gaps) the tool falls back to the plain 5h rolling window
+- The rate-limit `api_error` signature is **conservative** — accepts both
+  `status=429` and any inner `error.type` containing `rate_limit`/`usage_limit`.
+  We haven't directly observed a real 429 jsonl line yet, so the exact inner
+  type string can be tightened once one shows up
 - Recalibrate after plan changes
 
 ## Files
@@ -176,10 +253,12 @@ orchestrator or PM layer.
 | `budget_check.py` | Lightweight hook script (no deps); also runs auto-calibration |
 | `session_budget_manager.py` | Full async class for PM/orchestrator integration |
 | `calibrate.py` | Manual calibration entry from a `/usage` reading |
-| `_budget_core.py` | Shared core: `.env` loader, JSONL scan, EWMA learner |
+| `_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
+| `tests/test_budget_core.py` | Unit tests (44) — env loading, jsonl scan, anchor, signature matcher, EWMA |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line hook installer |
 | `skill/SKILL.md` | Claude Code skill definition |
+| `docs/internals.md` | Architecture deep-dive (anchor + 5h fallback + signature matcher + EWMA) |
 
 ## Contributing
 
