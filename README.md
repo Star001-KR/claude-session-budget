@@ -128,7 +128,7 @@ cp .env.example ~/.claude/.env
 ## Pause Modes
 
 By default, `budget_check.py` blocks immediately when usage reaches the pause
-threshold:
+threshold. Leave `BUDGET_PAUSE_MODE` unset, empty, or set to `block`:
 
 ```bash
 BUDGET_PAUSE_MODE=block

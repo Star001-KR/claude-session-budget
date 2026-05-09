@@ -531,6 +531,10 @@ class ThresholdConstantsTests(unittest.TestCase):
         self.assertEqual(core.HOOK_RESET_GRACE_SECS, 60)
         self.assertEqual(core.HOOK_MAX_SLEEP_SECS, 14400)
 
+    def test_empty_sleep_mode_falls_back_to_block(self):
+        core = reload_core({"BUDGET_PAUSE_MODE": ""})
+        self.assertEqual(core.HOOK_PAUSE_MODE, "block")
+
     def test_sleep_mode_picked_from_env(self):
         core = reload_core({
             "BUDGET_PAUSE_MODE": "sleep",
