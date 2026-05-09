@@ -12,6 +12,7 @@ Claude Code enforces a **rolling 5-hour session limit**. When running automated 
 ## How It Works
 
 ```mermaid
+%%{init: {'themeVariables': {'fontSize': '13px'}}}%%
 flowchart TD
     A([You run a task in Claude Code]) --> B[Claude Code logs API response<br/>to local JSONL]
     B --> C[budget_check.py hook<br/>fires before next tool call]
@@ -20,8 +21,6 @@ flowchart TD
     E -->|&lt; 80%| F[✓ Proceed silently]
     E -->|80–93%| G[⟳ Re-sync + log estimate]
     E -->|≥ 93%| H[⏸ Block dispatch until<br/>5-hour session resets]
-    F --> A
-    G --> A
     H -.->|wait for reset| A
 ```
 
