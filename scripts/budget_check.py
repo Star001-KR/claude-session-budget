@@ -31,77 +31,82 @@ def current_status():
     return limit, weighted, oldest, pct
 
 
-limit, weighted, oldest, pct = current_status()
+def main():
+    limit, weighted, oldest, pct = current_status()
 
-print(f"[session-budget] {pct*100:.1f}% used ({weighted:,} / {limit:,})", file=sys.stderr)
+    print(f"[session-budget] {pct*100:.1f}% used ({weighted:,} / {limit:,})", file=sys.stderr)
 
-if pct >= THRESHOLD_PAUSE:
-    reset_at = oldest + WINDOW_SECS
-    wait_min = max((reset_at - time.time()) / 60, 0)
-    when = datetime.fromtimestamp(reset_at).strftime("%H:%M")
+    if pct >= THRESHOLD_PAUSE:
+        reset_at = oldest + WINDOW_SECS
+        wait_min = max((reset_at - time.time()) / 60, 0)
+        when = datetime.fromtimestamp(reset_at).strftime("%H:%M")
 
-    if HOOK_PAUSE_MODE == "sleep":
-        started = time.time()
-        deadline = started + HOOK_MAX_SLEEP_SECS
-        print(
-            f"[session-budget] SLEEPING — {pct*100:.0f}% >= {THRESHOLD_PAUSE*100:.0f}%. "
-            f"Estimated reset ~{when} (~{wait_min:.0f} min). "
-            f"Rechecking every {HOOK_RECHECK_SECS}s; max sleep {HOOK_MAX_SLEEP_SECS}s.",
-            file=sys.stderr,
-        )
+        if HOOK_PAUSE_MODE == "sleep":
+            started = time.time()
+            deadline = started + HOOK_MAX_SLEEP_SECS
+            print(
+                f"[session-budget] SLEEPING — {pct*100:.0f}% >= {THRESHOLD_PAUSE*100:.0f}%. "
+                f"Estimated reset ~{when} (~{wait_min:.0f} min). "
+                f"Rechecking every {HOOK_RECHECK_SECS}s; max sleep {HOOK_MAX_SLEEP_SECS}s.",
+                file=sys.stderr,
+            )
 
-        while pct >= THRESHOLD_PAUSE:
-            now = time.time()
-            remaining_sleep_budget = deadline - now
-            if remaining_sleep_budget <= 0:
+            while pct >= THRESHOLD_PAUSE:
+                now = time.time()
+                remaining_sleep_budget = deadline - now
+                if remaining_sleep_budget <= 0:
+                    print(
+                        f"[session-budget] BLOCKING — still at {pct*100:.0f}% after "
+                        f"sleep-mode cap ({HOOK_MAX_SLEEP_SECS}s)",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+
+                time.sleep(min(HOOK_RECHECK_SECS, remaining_sleep_budget))
+                limit, weighted, oldest, pct = current_status()
+                reset_at = oldest + WINDOW_SECS
+                wait_min = max((reset_at - time.time()) / 60, 0)
+                when = datetime.fromtimestamp(reset_at).strftime("%H:%M")
                 print(
-                    f"[session-budget] BLOCKING — still at {pct*100:.0f}% after "
-                    f"sleep-mode cap ({HOOK_MAX_SLEEP_SECS}s)",
+                    f"[session-budget] recheck: {pct*100:.1f}% used "
+                    f"({weighted:,} / {limit:,}); reset ~{when} (~{wait_min:.0f} min)",
                     file=sys.stderr,
                 )
-                sys.exit(2)
 
-            time.sleep(min(HOOK_RECHECK_SECS, remaining_sleep_budget))
-            limit, weighted, oldest, pct = current_status()
-            reset_at = oldest + WINDOW_SECS
-            wait_min = max((reset_at - time.time()) / 60, 0)
-            when = datetime.fromtimestamp(reset_at).strftime("%H:%M")
+            if HOOK_RESET_GRACE_SECS:
+                grace_sleep = min(HOOK_RESET_GRACE_SECS, max(deadline - time.time(), 0))
+                if grace_sleep:
+                    time.sleep(grace_sleep)
+                limit, weighted, oldest, pct = current_status()
+
+            if pct < THRESHOLD_PAUSE:
+                print(
+                    f"[session-budget] resumed — {pct*100:.1f}% < {THRESHOLD_PAUSE*100:.0f}%",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
+
             print(
-                f"[session-budget] recheck: {pct*100:.1f}% used "
-                f"({weighted:,} / {limit:,}); reset ~{when} (~{wait_min:.0f} min)",
+                f"[session-budget] BLOCKING — still at {pct*100:.0f}% after grace period",
                 file=sys.stderr,
             )
-
-        if HOOK_RESET_GRACE_SECS:
-            grace_sleep = min(HOOK_RESET_GRACE_SECS, max(deadline - time.time(), 0))
-            if grace_sleep:
-                time.sleep(grace_sleep)
-            limit, weighted, oldest, pct = current_status()
-
-        if pct < THRESHOLD_PAUSE:
-            print(
-                f"[session-budget] resumed — {pct*100:.1f}% < {THRESHOLD_PAUSE*100:.0f}%",
-                file=sys.stderr,
-            )
-            sys.exit(0)
+            sys.exit(2)
 
         print(
-            f"[session-budget] BLOCKING — still at {pct*100:.0f}% after grace period",
+            f"[session-budget] BLOCKING — {pct*100:.0f}% >= {THRESHOLD_PAUSE*100:.0f}%. "
+            f"Resets ~{when} (~{wait_min:.0f} min)",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    print(
-        f"[session-budget] BLOCKING — {pct*100:.0f}% >= {THRESHOLD_PAUSE*100:.0f}%. "
-        f"Resets ~{when} (~{wait_min:.0f} min)",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    if pct >= THRESHOLD_SYNC:
+        print(
+            f"[session-budget] sync threshold passed ({pct*100:.0f}% >= {THRESHOLD_SYNC*100:.0f}%)",
+            file=sys.stderr,
+        )
 
-if pct >= THRESHOLD_SYNC:
-    print(
-        f"[session-budget] sync threshold passed ({pct*100:.0f}% >= {THRESHOLD_SYNC*100:.0f}%)",
-        file=sys.stderr,
-    )
+    sys.exit(0)
 
-sys.exit(0)
+
+if __name__ == "__main__":
+    main()

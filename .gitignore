@@ -2,3 +2,9 @@
 .budget_calibration.json
 __pycache__/
 *.pyc
+
+# PyPI build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/

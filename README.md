@@ -130,7 +130,40 @@ hook, add to `~/.claude/settings.json`:
 }
 ```
 
-### Option C — Manual Hook (no plugin, no brew)
+### Option C — PyPI
+
+```bash
+pip install claude-session-budget
+```
+
+This installs the `budget-check` and `budget-calibrate` console scripts and
+makes the package importable as `claude_session_budget`. Wire `budget-check`
+as a Claude Code PreToolUse hook the same way as the brew option (the binary
+will be on your `$PATH`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "budget-check"}]
+      }
+    ]
+  }
+}
+```
+
+For PM-layer / orchestrator integration:
+
+```python
+from claude_session_budget.session_budget_manager import SessionBudgetManager
+
+budget = SessionBudgetManager()
+status = budget.get_status()
+```
+
+### Option D — Manual Hook (no plugin, no brew, no pip)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main/install.sh | bash
@@ -151,7 +184,7 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-### Option D — Claude Code Skill (manual copy)
+### Option E — Claude Code Skill (manual copy)
 
 ```bash
 mkdir -p .claude/skills/session-budget
@@ -159,7 +192,7 @@ cp skills/budget-check/SKILL.md .claude/skills/session-budget/SKILL.md
 cp scripts/budget_check.py .claude/skills/session-budget/check.py
 ```
 
-### Option E — PM Layer / Orchestrator
+### Option F — PM Layer / Orchestrator (manual)
 
 ```python
 import sys; sys.path.insert(0, "scripts")  # or install as a package
@@ -300,6 +333,8 @@ match wins per key, but **process env always overrides**.
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |
+| `pyproject.toml` | PyPI packaging metadata (PEP 517/621) — `pip install claude-session-budget` |
+| `scripts/__init__.py` | Marks `scripts/` as the `claude_session_budget` package via `package-dir` mapping |
 | `docs/internals.md` | Architecture deep-dive (anchor + 5h fallback + signature matcher + EWMA) |
 | `LICENSE` | MIT |
 
