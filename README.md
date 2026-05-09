@@ -18,8 +18,8 @@ flowchart TD
     B --> C[budget_check.py hook<br/>fires before next tool call]
     C --> D[Scan JSONL +<br/>sum weighted tokens]
     D --> E{Usage % vs<br/>calibrated limit}
-    E -->|&lt; 80%| F[✓ Proceed silently]
-    E -->|80–93%| G[⟳ Re-sync + log estimate]
+    E -->|&lt; 80%| F([✓ Proceed silently])
+    E -->|80–93%| G([⟳ Re-sync + log estimate])
     E -->|≥ 93%| H[⏸ Block dispatch until<br/>5-hour session resets]
     H -.->|wait for reset| A
 ```
