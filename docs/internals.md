@@ -57,7 +57,7 @@ the real `/usage` shows 1–2%.
 whenever `/remote-control` activates. That timestamp is a strong indicator of
 "a new session is now attached."
 
-**Behavior:** [`find_session_anchor()`](_budget_core.py:153) returns the most
+**Behavior:** [`find_session_anchor()`](../scripts/_budget_core.py:153) returns the most
 recent in-window `bridge_status` ts, or `None` when no signal is present.
 
 **Caveats:**
@@ -70,7 +70,7 @@ recent in-window `bridge_status` ts, or `None` when no signal is present.
 
 ## Layer 2 — Window scan
 
-[`scan_window()`](_budget_core.py:195) walks every jsonl in `PROJECTS_DIR`,
+[`scan_window()`](../scripts/_budget_core.py:195) walks every jsonl in `PROJECTS_DIR`,
 filters by file mtime first (cheap), then per-line `timestamp >= cutoff`.
 
 **Cutoff calculation:**
@@ -102,7 +102,7 @@ model tiers.
 
 ## Layer 3 — Signature matcher
 
-[`_looks_like_rate_limit(parsed)`](_budget_core.py:140) operates on the
+[`_looks_like_rate_limit(parsed)`](../scripts/_budget_core.py:140) operates on the
 *parsed dict*, not the raw line.
 
 **Match rule:**
@@ -164,7 +164,7 @@ wild. Once one shows up, the inner type can be tightened from "contains
 
 ## Layer 4 — EWMA calibrator
 
-[`maybe_update_calibration()`](_budget_core.py:264) is invoked on every
+[`maybe_update_calibration()`](../scripts/_budget_core.py:264) is invoked on every
 hook fire. For each new in-window event (deduped via `seen_events`):
 
 ```
@@ -178,7 +178,7 @@ observation. Configurable via `BUDGET_EWMA_ALPHA`.
 "how many weighted tokens had we used when Anthropic rejected us?" That's
 the empirical 100% reading.
 
-Manual calibration ([`record_observed_pct()`](_budget_core.py:295)) is
+Manual calibration ([`record_observed_pct()`](../scripts/_budget_core.py:295)) is
 identical math, but the observation comes from `/usage`'s percentage instead
 of an api_error event. Useful as a cold start when no rate-limit has fired
 yet.

@@ -3,9 +3,9 @@ set -e
 REPO="https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main"
 HOOKS_DIR="$HOME/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
-curl -fsSL "$REPO/_budget_core.py" -o "$HOOKS_DIR/_budget_core.py"
-curl -fsSL "$REPO/budget_check.py" -o "$HOOKS_DIR/budget_check.py"
-curl -fsSL "$REPO/calibrate.py" -o "$HOOKS_DIR/calibrate.py"
+curl -fsSL "$REPO/scripts/_budget_core.py" -o "$HOOKS_DIR/_budget_core.py"
+curl -fsSL "$REPO/scripts/budget_check.py" -o "$HOOKS_DIR/budget_check.py"
+curl -fsSL "$REPO/scripts/calibrate.py" -o "$HOOKS_DIR/calibrate.py"
 curl -fsSL "$REPO/.env.example" -o "$HOOKS_DIR/.env.example" || true
 chmod +x "$HOOKS_DIR/budget_check.py" "$HOOKS_DIR/calibrate.py"
 python3 - << 'EOF'

@@ -84,7 +84,7 @@ The calibrated limit is **auto-learned** from real Anthropic API errors:
 You can also seed/refine the limit manually with one `/usage` reading:
 
 ```bash
-python3 calibrate.py --observed-pct 67
+python3 scripts/calibrate.py --observed-pct 67
 ```
 
 Known baselines (used until auto-learning kicks in):
@@ -93,7 +93,20 @@ Known baselines (used until auto-learning kicks in):
 
 ## Installation
 
-### Option A — Claude Code Hook (Recommended)
+### Option A — Claude Code Plugin Marketplace (Recommended)
+
+This repo is itself a Claude Code marketplace. Inside Claude Code:
+
+```
+/plugin marketplace add Star001-KR/claude-session-budget
+/plugin install session-budget
+```
+
+The PreToolUse hook is wired automatically via [hooks/hooks.json](hooks/hooks.json),
+the [skill](skills/budget-check/SKILL.md) becomes available as
+`/session-budget:budget-check`, and all scripts run from `${CLAUDE_PLUGIN_ROOT}/scripts/`.
+
+### Option B — Manual Hook (no plugin)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main/install.sh | bash
@@ -114,17 +127,18 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-### Option B — Claude Code Skill
+### Option C — Claude Code Skill (manual copy)
 
 ```bash
 mkdir -p .claude/skills/session-budget
-cp skill/SKILL.md .claude/skills/session-budget/SKILL.md
-cp budget_check.py .claude/skills/session-budget/check.py
+cp skills/budget-check/SKILL.md .claude/skills/session-budget/SKILL.md
+cp scripts/budget_check.py .claude/skills/session-budget/check.py
 ```
 
-### Option C — PM Layer / Orchestrator
+### Option D — PM Layer / Orchestrator
 
 ```python
+import sys; sys.path.insert(0, "scripts")  # or install as a package
 from session_budget_manager import SessionBudgetManager
 
 budget = SessionBudgetManager()
@@ -162,7 +176,7 @@ remaining string:
 Set thresholds via env vars **or** a `.env` file (loaded automatically):
 
 ```bash
-BUDGET_SYNC_PCT=80 BUDGET_PAUSE_PCT=93 python3 budget_check.py
+BUDGET_SYNC_PCT=80 BUDGET_PAUSE_PCT=93 python3 scripts/budget_check.py
 ```
 
 `.env` lookup order — first hit wins per key, but **process env always overrides**:
@@ -248,17 +262,21 @@ match wins per key, but **process env always overrides**.
 
 ## Files
 
-| File | Description |
+| Path | Description |
 |---|---|
-| `budget_check.py` | Lightweight hook script (no deps); also runs auto-calibration |
-| `session_budget_manager.py` | Full async class for PM/orchestrator integration |
-| `calibrate.py` | Manual calibration entry from a `/usage` reading |
-| `_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
+| `.claude-plugin/plugin.json` | Plugin manifest (name, version, author, license) |
+| `.claude-plugin/marketplace.json` | Marketplace manifest — lets `/plugin marketplace add` resolve this repo |
+| `hooks/hooks.json` | PreToolUse hook declaration using `${CLAUDE_PLUGIN_ROOT}` |
+| `skills/budget-check/SKILL.md` | Claude Code skill definition (auto-discovered as `/session-budget:budget-check`) |
+| `scripts/budget_check.py` | Lightweight hook script (no deps); also runs auto-calibration |
+| `scripts/session_budget_manager.py` | Full async class for PM/orchestrator integration |
+| `scripts/calibrate.py` | Manual calibration entry from a `/usage` reading |
+| `scripts/_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
 | `tests/test_budget_core.py` | Unit tests (44) — env loading, jsonl scan, anchor, signature matcher, EWMA |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
-| `install.sh` | One-line hook installer |
-| `skill/SKILL.md` | Claude Code skill definition |
+| `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `docs/internals.md` | Architecture deep-dive (anchor + 5h fallback + signature matcher + EWMA) |
+| `LICENSE` | MIT |
 
 ## Contributing
 
