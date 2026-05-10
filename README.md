@@ -389,15 +389,11 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
   preceded the first jsonl message
 - The rate-limit `api_error` signature is **conservative** — accepts both
   `status=429` and any inner `error.type` containing `rate_limit`/`usage_limit`.
-  Empirical status: the structural `type=system, subtype=api_error` shape has
-  been validated against real captures in production user logs (n=17: nine
-  `status=401`, eight `status=502`). The `status=429` variant specifically has
-  not appeared in any captured jsonl — Claude Code likely surfaces rate-limit
-  responses via stdout (e.g. "Claude usage limit reached.") rather than the
-  jsonl path. Desktop strings reference a `rate_limit_event` stream message
-  type, but it does not land in jsonl either. Once a real 429 jsonl dump is
-  captured, the inner `error.type` matcher can be tightened from "contains
-  `rate_limit`" to the exact string
+  The structural shape has been validated against real `status=401`/`502`
+  captures, but no real `status=429` jsonl line has been observed yet (Claude
+  Code likely surfaces rate-limit via stdout instead). Details and the
+  refinement plan once a real 429 is captured live in
+  [`docs/internals.md` Layer 3](docs/internals.md#layer-3--signature-matcher)
 - Recalibrate after plan changes
 
 ## Files

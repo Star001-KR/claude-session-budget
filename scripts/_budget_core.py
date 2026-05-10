@@ -318,6 +318,15 @@ def _looks_like_rate_limit(parsed):
     topic (e.g. debugging this very tool) and that produced a self-poisoning
     EWMA learning loop. Structural signature matching eliminates that class
     of false positive entirely.
+
+    Empirical status (n=17 api_error captures from one heavy-user's logs):
+    this matcher returned 0 hits — 9×status=401, 8×status=502, 0×status=429.
+    Claude Code likely surfaces rate-limit via stdout text ("Claude usage
+    limit reached.") rather than persisting to jsonl. The matcher is kept
+    as forward-compatible insurance for the day a real 429 shows up in
+    jsonl; until then, live calibration runs through record_observed_pct()
+    (manual /usage paste) and auto_calibrate.py (background pty spawn).
+    See docs/internals.md Layer 3 for the refinement plan once captured.
     """
     if not isinstance(parsed, dict):
         return False
