@@ -209,15 +209,22 @@ running `budget_check.py` 100 times against the same event learns it once.
 The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
 (86 tests). Each layer has its own test class:
 
-- `LoadEnvFileTests` — env loader semantics
+- `LoadEnvFileTests` — env loader semantics (incl. opt-in cwd `.env`)
 - `ParseTsTests` — timestamp parsing edge cases
-- `RateLimitSignatureTests` — Layer 3 (10 cases incl. negative/regression)
-- `ScanWindowTests` — Layer 2 fundamentals + body-text false-positive guard
-- `FindSessionAnchorTests` — Layer 1
-- `ScanWindowAnchorTests` — Layer 1+2 integration
+- `RateLimitSignatureTests` — Layer 3 signature matcher, incl. body-text
+  false-positive regression cases
+- `ScanWindowTests` — Layer 1 rolling-5h scan, mtime fast-path, malformed
+  line tolerance, body-text false-positive guard
+- `ScanWindowAnchorTests` — Layer 1 `oldest` semantics under mixed inputs
+- `ComputeWeightedTests` — TTL-aware cache_creation accounting (5m vs 1h,
+  legacy field supersession)
 - `CalibrationTests` / `RecordObservedPctTests` / `MaybeUpdateCalibrationTests`
-  — Layer 4
+  — Layer 4 EWMA + atomic save round-trips
 - `ThresholdConstantsTests` — env-var binding incl. sleep-mode constants
+- `AutoCalibrateTriggerTests` — milestone gating, cooldown, window-key
+  rollover for `should_fire_auto_calibrate()`
+- `ParseUsageTextTests` — `/usage` panel scraping (ANSI strip, multi-row
+  panel, missing-section tolerance)
 
 Tests use `importlib.reload()` to pick up env-var changes since module-level
 constants cache them at import time.
