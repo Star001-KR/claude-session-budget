@@ -23,12 +23,25 @@ flowchart TD
     G -->|80–93%| I([⟳ Proceed + log sync notice])
     G -->|≥ 93%| J[⏸ Block dispatch until<br/>5-hour session resets]
     J -.->|wait for reset| A
+
+    G -.->|first crossing of<br/>80 / 90 / 95% per window| K[fork auto_calibrate.py<br/>in background]
+    K --> L[Spawn `claude` under pty,<br/>send /usage, capture panel]
+    L --> M[Parse + EWMA-merge<br/>observed % into limit]
+    M -.->|refines limit<br/>for next hook firing| G
 ```
 
 Claude Code writes every API response to local JSONL files:
 ~/.claude/projects/<project-path>/<session-id>.jsonl
 
-Each assistant message contains token counts in a `usage` field. By summing these with pricing-ratio weights and calibrating against one `/usage` observation, we estimate session usage in real time.
+Each assistant message contains token counts in a `usage` field. The hook
+sums these with cost-equivalent weights (TTL-aware for cache writes) and
+divides by a calibrated limit to estimate session usage in real time. Two
+self-correction paths keep that limit honest: a structural detector for
+real `429 / rate_limit` API errors in the JSONL, and a background worker
+that drives `claude /usage` itself when the estimate first crosses each
+of `BUDGET_AUTO_CAL_MILESTONES` (default `80, 90, 95%`) — see
+[Background auto-calibration](#background-auto-calibration-zero-user-input)
+below. The user never has to copy-paste anything for either path.
 
 ### Why no `bridge_status` anchor?
 
