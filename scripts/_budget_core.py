@@ -8,7 +8,7 @@ Responsibilities:
   - Persist auto-learned calibration to ~/.claude/.budget_calibration.json.
   - Detect rate-limit events in JSONL and EWMA-update the calibrated limit.
 """
-import glob, json, os, time
+import glob, json, os, tempfile, time
 from datetime import datetime
 
 WINDOW_SECS = 5 * 3600
@@ -100,10 +100,29 @@ def load_calibration():
 
 
 def save_calibration(data):
+    """Atomic write: tempfile in the same dir, fsync, then os.replace.
+
+    POSIX rename(2) is atomic within a filesystem, so a reader either sees
+    the previous file or the fully written new one — never a truncated or
+    half-written intermediate. Protects against SIGINT, ENOSPC, and concurrent
+    writers truncating each other mid-dump.
+    """
     try:
         os.makedirs(os.path.dirname(CALIBRATION_FILE), exist_ok=True)
-        with open(CALIBRATION_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+        dirpath = os.path.dirname(CALIBRATION_FILE) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".budget_cal_", suffix=".tmp", dir=dirpath)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CALIBRATION_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
 

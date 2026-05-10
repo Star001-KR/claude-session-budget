@@ -422,6 +422,47 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(w["output_tokens"], 5.0)  # untouched default
             self.assertNotIn("bogus_key", w)
 
+    def test_save_leaves_no_temp_files_on_success(self):
+        """Atomic write pattern: after a successful save, the calibration
+        directory contains only the final file — no .budget_cal_*.tmp
+        leftovers from tempfile.mkstemp()."""
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "calib.json")
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            core.save_calibration({"limit": 99_999_999})
+            self.assertEqual(sorted(os.listdir(tmp)), ["calib.json"])
+            with open(cf) as f:
+                self.assertEqual(json.load(f)["limit"], 99_999_999)
+
+    def test_save_preserves_existing_on_serialization_failure(self):
+        """If json.dump raises mid-write (here: a non-serializable value),
+        the original calibration file must remain intact — no truncation,
+        no half-written state. This is the core atomic guarantee that the
+        prior open(..., 'w') + json.dump pattern did not provide."""
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "calib.json")
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            core.save_calibration({"limit": 12345, "history": []})
+            with open(cf) as f:
+                before = f.read()
+
+            class NotJsonSerializable:
+                pass
+
+            # save_calibration swallows the inner exception by design;
+            # the assertion is that the on-disk file was not corrupted.
+            core.save_calibration({"limit": NotJsonSerializable()})
+
+            with open(cf) as f:
+                self.assertEqual(f.read(), before)
+            self.assertEqual(sorted(os.listdir(tmp)), ["calib.json"])
+
 
 class RecordObservedPctTests(unittest.TestCase):
     def test_seeds_when_no_prior(self):
