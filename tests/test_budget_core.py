@@ -656,6 +656,51 @@ class ThresholdConstantsTests(unittest.TestCase):
         self.assertEqual(core.HOOK_RESET_GRACE_SECS, 60)
         self.assertEqual(core.HOOK_MAX_SLEEP_SECS, 14400)
 
+    def test_alpha_negative_falls_back_to_default(self):
+        core = reload_core({"BUDGET_EWMA_ALPHA": "-0.5"})
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+
+    def test_alpha_above_one_falls_back_to_default(self):
+        core = reload_core({"BUDGET_EWMA_ALPHA": "1.5"})
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+
+    def test_alpha_garbage_falls_back_to_default(self):
+        core = reload_core({"BUDGET_EWMA_ALPHA": "not-a-number"})
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+
+    def test_alpha_boundary_values_accepted(self):
+        for raw, expected in (("0", 0.0), ("1", 1.0), ("0.05", 0.05)):
+            core = reload_core({"BUDGET_EWMA_ALPHA": raw})
+            self.assertAlmostEqual(core.EWMA_ALPHA, expected)
+
+    def test_pct_zero_falls_back_to_default(self):
+        core = reload_core({"BUDGET_SYNC_PCT": "0", "BUDGET_PAUSE_PCT": "0"})
+        self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.80)
+        self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.93)
+
+    def test_pct_negative_falls_back_to_default(self):
+        core = reload_core({"BUDGET_SYNC_PCT": "-10", "BUDGET_PAUSE_PCT": "-5"})
+        self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.80)
+        self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.93)
+
+    def test_pct_above_100_falls_back_to_default(self):
+        core = reload_core({"BUDGET_SYNC_PCT": "150", "BUDGET_PAUSE_PCT": "200"})
+        self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.80)
+        self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.93)
+
+    def test_sync_above_pause_resets_both_to_defaults(self):
+        # Logical inversion (sync threshold higher than pause threshold) is
+        # nonsensical: sync would never trigger before pause already blocked.
+        # Reset both to defaults rather than persist the broken ordering.
+        core = reload_core({"BUDGET_SYNC_PCT": "95", "BUDGET_PAUSE_PCT": "70"})
+        self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.80)
+        self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.93)
+
+    def test_sync_equal_pause_allowed(self):
+        core = reload_core({"BUDGET_SYNC_PCT": "85", "BUDGET_PAUSE_PCT": "85"})
+        self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.85)
+        self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.85)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
