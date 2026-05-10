@@ -169,6 +169,9 @@ status = budget.get_status()
 curl -fsSL https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main/install.sh | bash
 ```
 
+The installer pins to the tagged release and verifies downloaded scripts
+against `SHA256SUMS` from that release before writing to `~/.claude/hooks`.
+
 Or manually add to `~/.claude/settings.json`:
 
 ```json

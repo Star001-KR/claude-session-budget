@@ -13,7 +13,7 @@ jobs:
       url: https://pypi.org/p/claude-session-budget
     permissions:
       id-token: write
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -35,3 +35,14 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Generate SHA256SUMS for hook scripts
+        if: github.event_name == 'release'
+        working-directory: scripts
+        run: sha256sum _budget_core.py budget_check.py calibrate.py > ../SHA256SUMS
+
+      - name: Upload SHA256SUMS to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" SHA256SUMS --clobber

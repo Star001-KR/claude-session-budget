@@ -64,13 +64,15 @@ jobs:
           PLUGIN_VERSION=$(python -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['version'])")
           MARKETPLACE_VERSION=$(python -c "import json; print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
           FORMULA_VERSION=$(python -c "import re; m=re.search(r'archive/refs/tags/v([0-9.]+)\.tar\.gz', open('Formula/claude-session-budget.rb').read()); print(m.group(1))")
+          INSTALL_VERSION=$(python -c "import re; m=re.search(r'^TAG=\"v([0-9.]+)\"', open('install.sh').read(), re.M); print(m.group(1))")
           echo "package=$PY_VERSION"
           echo "pyproject=$PYPROJECT_VERSION"
           echo "setup.cfg=$SETUPCFG_VERSION"
           echo "plugin.json=$PLUGIN_VERSION"
           echo "marketplace.json=$MARKETPLACE_VERSION"
           echo "Formula=$FORMULA_VERSION"
-          for v in "$PYPROJECT_VERSION" "$SETUPCFG_VERSION" "$PLUGIN_VERSION" "$MARKETPLACE_VERSION" "$FORMULA_VERSION"; do
+          echo "install.sh=$INSTALL_VERSION"
+          for v in "$PYPROJECT_VERSION" "$SETUPCFG_VERSION" "$PLUGIN_VERSION" "$MARKETPLACE_VERSION" "$FORMULA_VERSION" "$INSTALL_VERSION"; do
             if [ "$v" != "$PY_VERSION" ]; then
               echo "version mismatch: package=$PY_VERSION but file has $v"
               exit 1

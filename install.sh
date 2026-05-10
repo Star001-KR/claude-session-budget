@@ -1,13 +1,40 @@
 #!/usr/bin/env bash
 set -e
-REPO="https://raw.githubusercontent.com/Star001-KR/claude-session-budget/main"
+
+# Pinned to a release tag (not `main`) so the download target is immutable.
+# CI verifies this version stays aligned with the other version-bearing files.
+TAG="v1.1.3"
+REPO="https://raw.githubusercontent.com/Star001-KR/claude-session-budget/${TAG}"
+SUMS_URL="https://github.com/Star001-KR/claude-session-budget/releases/download/${TAG}/SHA256SUMS"
 HOOKS_DIR="$HOME/.claude/hooks"
+
+# sha256 helper — Linux ships sha256sum, macOS ships shasum.
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_check() { sha256sum -c "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_check() { shasum -a 256 -c "$1"; }
+else
+    echo "ERROR: need sha256sum or shasum on PATH" >&2
+    exit 1
+fi
+
 mkdir -p "$HOOKS_DIR"
-curl -fsSL "$REPO/scripts/_budget_core.py" -o "$HOOKS_DIR/_budget_core.py"
-curl -fsSL "$REPO/scripts/budget_check.py" -o "$HOOKS_DIR/budget_check.py"
-curl -fsSL "$REPO/scripts/calibrate.py" -o "$HOOKS_DIR/calibrate.py"
+
+# Stage downloads in a temp dir; only move into HOOKS_DIR after sha256 verifies.
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+curl -fsSL "$SUMS_URL" -o "$TMPDIR/SHA256SUMS"
+for f in _budget_core.py budget_check.py calibrate.py; do
+    curl -fsSL "$REPO/scripts/$f" -o "$TMPDIR/$f"
+done
+
+(cd "$TMPDIR" && sha256_check SHA256SUMS)
+
+mv "$TMPDIR/_budget_core.py" "$TMPDIR/budget_check.py" "$TMPDIR/calibrate.py" "$HOOKS_DIR/"
 curl -fsSL "$REPO/.env.example" -o "$HOOKS_DIR/.env.example" || true
 chmod +x "$HOOKS_DIR/budget_check.py" "$HOOKS_DIR/calibrate.py"
+
 python3 - << 'EOF'
 import json, os
 p = os.path.expanduser("~/.claude/settings.json")
