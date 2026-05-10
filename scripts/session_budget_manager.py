@@ -31,29 +31,25 @@ class SessionBudgetManager:
             return self._explicit_limit
         return get_calibrated_limit()
 
-    def _refresh_limit(self):
+    def _snapshot(self):
+        """Single JSONL scan; refresh calibration off the same result."""
+        scan = scan_window()
         if self._explicit_limit is None:
-            maybe_update_calibration()
-
-    def _compute(self):
-        weighted, _, _ = scan_window()
+            maybe_update_calibration(scan_result=scan)
+        weighted, oldest, _ = scan
         limit = self.calibrated_limit
-        return min(weighted / limit, 1.0) if limit else 0.0, weighted
-
-    def _estimate_reset(self):
-        _, oldest, _ = scan_window()
-        return oldest + WINDOW_SECS
+        pct = min(weighted / limit, 1.0) if limit else 0.0
+        return pct, weighted, oldest, limit
 
     def get_status(self):
-        self._refresh_limit()
-        pct, weighted = self._compute()
-        reset_at = self._estimate_reset()
+        pct, weighted, oldest, limit = self._snapshot()
+        reset_at = oldest + WINDOW_SECS
         remaining = max(reset_at - time.time(), 0)
         hrs, rem = divmod(int(remaining), 3600)
         return {
             "pct": round(pct * 100, 1),
             "weighted_tokens": weighted,
-            "calibrated_limit": self.calibrated_limit,
+            "calibrated_limit": limit,
             "reset_at": reset_at,
             "remaining_secs": int(remaining),
             "remaining_str": "already reset" if remaining == 0 else f"{hrs}h {rem//60}m",
@@ -61,12 +57,10 @@ class SessionBudgetManager:
 
     async def check_before_dispatch(self):
         """Returns seconds to wait (0 = proceed immediately)."""
-        self._refresh_limit()
-        pct, weighted = self._compute()
-        limit = self.calibrated_limit
+        pct, weighted, oldest, limit = self._snapshot()
         logger.info(f"[Budget] {pct*100:.1f}% ({weighted:,}/{limit:,})")
         if pct >= THRESHOLD_PAUSE:
-            wait = max(self._estimate_reset() - time.time(), 0) + 60
+            wait = max(oldest + WINDOW_SECS - time.time(), 0) + 60
             logger.warning(
                 f"[Budget] {pct*100:.0f}% >= {THRESHOLD_PAUSE*100:.0f}% — waiting {wait/60:.1f}min"
             )

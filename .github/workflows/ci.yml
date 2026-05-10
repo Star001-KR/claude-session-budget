@@ -45,7 +45,7 @@ jobs:
             ls _install_test
             exit 1
           fi
-          PYTHONPATH=_install_test python -c "import claude_session_budget; assert claude_session_budget.__version__ == '1.1.1', claude_session_budget.__version__; print('sdist install OK:', claude_session_budget.__version__)"
+          PYTHONPATH=_install_test python -c "import claude_session_budget; assert claude_session_budget.__version__ == '1.1.2', claude_session_budget.__version__; print('sdist install OK:', claude_session_budget.__version__)"
 
       - name: Install wheel and verify console scripts
         run: |

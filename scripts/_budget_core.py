@@ -292,11 +292,17 @@ def scan_window(now=None):
     return total, oldest, events
 
 
-def maybe_update_calibration():
-    """Detect new rate-limit events; EWMA-update the stored limit. Returns effective limit."""
+def maybe_update_calibration(scan_result=None):
+    """Detect new rate-limit events; EWMA-update the stored limit. Returns effective limit.
+
+    Pass `scan_result` (the tuple returned by scan_window()) to reuse a scan
+    the caller already performed — avoids re-walking JSONL twice per hook.
+    """
     cal = load_calibration()
     seen = set(cal.get("seen_events") or [])
-    _, _, events = scan_window()
+    if scan_result is None:
+        scan_result = scan_window()
+    _, _, events = scan_result
 
     changed = False
     for ts, weighted_at_event in events:
