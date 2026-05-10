@@ -36,6 +36,7 @@ def reload_core(env_overrides):
         "BUDGET_RESET_GRACE_SECS",
         "BUDGET_MAX_SLEEP_SECS",
         "BUDGET_EWMA_ALPHA",
+        "BUDGET_LOAD_PROJECT_ENV",
     ]
     for k in keys:
         os.environ.pop(k, None)
@@ -145,6 +146,44 @@ class LoadEnvFileTests(unittest.TestCase):
     def test_missing_file_silent(self):
         core = reload_core({})
         core._load_env_file("/no/such/file/at/all")  # must not raise
+
+    def test_module_import_skips_cwd_env_by_default(self):
+        """Without BUDGET_LOAD_PROJECT_ENV, importing _budget_core must not
+        load ./.env from the current working directory. Removes the
+        import-time cwd side effect and the untrusted-cwd attack surface."""
+        with TemporaryDirectory() as tmp:
+            envfile = os.path.join(tmp, ".env")
+            with open(envfile, "w") as f:
+                f.write("CWD_ENV_KEY_DEFAULT_OFF=should_not_load\n")
+            os.environ.pop("CWD_ENV_KEY_DEFAULT_OFF", None)
+            prev = os.getcwd()
+            try:
+                os.chdir(tmp)
+                reload_core({"BUDGET_PROJECTS_DIR": tmp})
+                self.assertNotIn("CWD_ENV_KEY_DEFAULT_OFF", os.environ)
+            finally:
+                os.chdir(prev)
+                os.environ.pop("CWD_ENV_KEY_DEFAULT_OFF", None)
+
+    def test_module_import_loads_cwd_env_when_opted_in(self):
+        """With BUDGET_LOAD_PROJECT_ENV=1, importing _budget_core re-enables
+        the per-project override path."""
+        with TemporaryDirectory() as tmp:
+            envfile = os.path.join(tmp, ".env")
+            with open(envfile, "w") as f:
+                f.write("CWD_ENV_KEY_OPTED_IN=loaded\n")
+            os.environ.pop("CWD_ENV_KEY_OPTED_IN", None)
+            prev = os.getcwd()
+            try:
+                os.chdir(tmp)
+                reload_core({
+                    "BUDGET_PROJECTS_DIR": tmp,
+                    "BUDGET_LOAD_PROJECT_ENV": "1",
+                })
+                self.assertEqual(os.environ.get("CWD_ENV_KEY_OPTED_IN"), "loaded")
+            finally:
+                os.chdir(prev)
+                os.environ.pop("CWD_ENV_KEY_OPTED_IN", None)
 
 
 class ParseTsTests(unittest.TestCase):

@@ -34,8 +34,14 @@ def _load_env_file(path):
         pass
 
 
-_load_env_file(os.path.join(os.getcwd(), ".env"))
+# ~/.claude/.env is always loaded (global config under user control).
+# ./.env (cwd) is opt-in: importing this module from an untrusted repo
+# should not silently inject BUDGET_* (or anything else) into os.environ.
+# Set BUDGET_LOAD_PROJECT_ENV=1 in process env or in ~/.claude/.env to
+# restore the per-project override behavior.
 _load_env_file(os.path.expanduser("~/.claude/.env"))
+if os.environ.get("BUDGET_LOAD_PROJECT_ENV", "").strip().lower() in ("1", "true", "yes"):
+    _load_env_file(os.path.join(os.getcwd(), ".env"))
 
 
 PROJECTS_DIR = os.environ.get("BUDGET_PROJECTS_DIR", os.path.expanduser("~/.claude/projects"))

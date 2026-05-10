@@ -239,11 +239,16 @@ Set thresholds via env vars **or** a `.env` file (loaded automatically):
 BUDGET_SYNC_PCT=80 BUDGET_PAUSE_PCT=93 python3 scripts/budget_check.py
 ```
 
-`.env` lookup order — first hit wins per key, but **process env always overrides**:
+`.env` lookup order — process env always overrides:
 
-1. `./.env` (current working directory — per-project override)
-2. `~/.claude/.env` (global default for all sessions)
+1. `~/.claude/.env` (global default, always loaded)
+2. `./.env` (current working directory) — **opt-in**: set
+   `BUDGET_LOAD_PROJECT_ENV=1` to enable the per-project override
 3. Built-in defaults
+
+> **Migration from <1.1.4**: `./.env` is no longer auto-loaded by default.
+> To restore per-project override behavior, add `BUDGET_LOAD_PROJECT_ENV=1`
+> to `~/.claude/.env` (or your shell env).
 
 Copy `.env.example` to get started:
 
@@ -290,8 +295,8 @@ orchestrator or PM layer.
 
 ## Environment Variables
 
-All variables can be set in process env, `./.env`, or `~/.claude/.env`. First
-match wins per key, but **process env always overrides**.
+All variables can be set in process env or `~/.claude/.env`. **Process env
+always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -305,6 +310,7 @@ match wins per key, but **process env always overrides**.
 | `BUDGET_CALIBRATED_LIMIT` | *(unset)* | Hard override of stored calibrated limit (weighted tokens) |
 | `BUDGET_PROJECTS_DIR` | `~/.claude/projects` | jsonl scan root |
 | `BUDGET_CALIBRATION_FILE` | `~/.claude/.budget_calibration.json` | Persistence path for auto-calibration |
+| `BUDGET_LOAD_PROJECT_ENV` | *(unset)* | Set to `1` to also load `./.env` from cwd at module import. Disabled by default to avoid an untrusted-cwd attack surface and import-time side effects |
 
 ## Limitations
 
