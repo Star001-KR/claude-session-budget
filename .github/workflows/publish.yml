@@ -1,0 +1,37 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/claude-session-budget
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Sanity-check sdist installs as a real package (not UNKNOWN-0.0.0)
+        run: |
+          set -e
+          python -m pip install --target _publish_check dist/claude_session_budget-*.tar.gz
+          test -d _publish_check/claude_session_budget || (echo "sdist regression — refusing to publish UNKNOWN-0.0.0"; exit 1)
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
