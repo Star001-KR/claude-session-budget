@@ -156,10 +156,36 @@ along the lines of `rate_limit_error`. User/assistant message bodies have
 The signature matcher's gate at step 1 cuts the false-positive class to
 zero while preserving the legitimate signal.
 
-**Conservatism:** We accept both `status=429` and inner-type substring
-matches because we haven't directly observed a real 429 jsonl line in the
-wild. Once one shows up, the inner type can be tightened from "contains
-`rate_limit`" to the exact string.
+**Conservatism — empirical status.** The structural shape above (`type=system,
+subtype=api_error` with `error.status` as the HTTP code) has been validated
+against real captures in production user jsonl (n=17 total):
+
+| `error.status` | Count | Notes |
+|---|---|---|
+| 401 | 9 | `authentication_error` |
+| 502 | 8 | Cloudflare bad gateway, with `retryInMs` / `retryAttempt` metadata |
+| 429 | **0** | not captured in any user log to date |
+
+The 401/502 captures confirm our gating shape is correct, but the `status=429`
+variant specifically has never appeared in jsonl. The most likely explanation:
+Claude Code surfaces rate-limit responses via stdout text ("Claude usage limit
+reached.") rather than the jsonl persistence path. Strings-extraction of the
+Desktop bundle shows two corroborating signals:
+
+- a stream-message set `new Set(["result", "rate_limit_event"])` — i.e.
+  `rate_limit_event` is a *stream event* type, distinct from `api_error`, but
+  empirically it does not get persisted to jsonl either
+- a Desktop-side text classifier:
+  `c.includes("hit your limit") || c.includes("out of extra usage")` →
+  `category: "rate_limit"` — i.e. Desktop derives the rate_limit category from
+  CLI stdout text, not from a structured jsonl entry
+
+We therefore keep both `status=429` and the inner-type substring match
+(`rate_limit` / `usage_limit`) as accept rules: cheap, safe, and the only
+sensible cold-start when no real 429 jsonl example exists. Once one is
+captured, the inner type can be tightened from "contains `rate_limit`" to
+the exact string, and a stdout-pipe text matcher could be added as a parallel
+Layer 3 signal if Anthropic does not start persisting 429s to jsonl.
 
 ## Layer 4 — EWMA calibrator
 
@@ -231,8 +257,22 @@ constants cache them at import time.
 
 ## Open questions
 
-- What does Anthropic's real 429 jsonl line look like? (Tightens Layer 3.)
+- **Does Claude Code ever persist a 429 to jsonl, or only to stdout?**
+  Empirically (n=17 api_error captures across one heavy-user's logs) the
+  answer so far is "stdout only." If confirmed across more users, Layer 3
+  may need a stdout-pipe text matcher (for `"hit your limit"` /
+  `"out of extra usage"`) as a parallel signal — but we'd need to be very
+  careful to source that text from the CLI subprocess's stderr/stdout, not
+  from message-body strings, to avoid re-introducing the self-poisoning
+  loop that motivated the structural matcher in the first place.
+- **What does Anthropic's real 429 jsonl line look like, if it exists?**
+  Captures of 401/502 carry `retryInMs`, `retryAttempt`, `maxRetries`,
+  `uuid`, `headers`, `requestID` — we'd expect 429 to follow the same
+  shape, but the inner `error.type` exact string and any
+  `anthropic-ratelimit-*` headers remain unverified.
 - Can `error.headers` from a real 429 carry `anthropic-ratelimit-reset`
   directly? If yes, we can read reset epoch *exactly* instead of estimating.
+  (Neither 401 nor 502 captures carried this header, so the data point
+  exists only in the unobserved 429 case.)
 - Are weights identical across Sonnet / Haiku, or do they need per-model
   multipliers when those models contribute to the same 5h budget?
