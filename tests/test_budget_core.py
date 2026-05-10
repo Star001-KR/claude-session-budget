@@ -655,6 +655,40 @@ class ScanWindowAnchorTests(unittest.TestCase):
             self.assertEqual(total, 0)
             self.assertAlmostEqual(oldest, now - 60, delta=1)
 
+    def test_pre_anchor_rate_limit_event_excluded_from_events(self):
+        """A rate-limit api_error before the anchor must not appear in events.
+        The anchor authoritatively raises the cutoff; pre-anchor rate-limit
+        signatures cannot influence calibration. Regression guard for the
+        single-pass refactor — the anchor is now decided after raw collection,
+        so the cutoff filter must still drop pre-anchor rate-limit lines."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 7200, input_=10_000),       # pre-anchor usage
+                api_error_entry(now - 5400, status=429),      # pre-anchor 429
+                bridge_status_entry(now - 3600),              # anchor
+                usage_entry(now - 1800, input_=10),           # post-anchor
+            ])
+            total, oldest, events = core.scan_window(now=now)
+            self.assertEqual(total, 10)
+            self.assertAlmostEqual(oldest, now - 3600, delta=1)
+            self.assertEqual(events, [])
+
+    def test_future_bridge_status_not_used_as_anchor(self):
+        """A bridge_status with ts > now (clock skew, replayed line) must
+        not be promoted to anchor. The single-pass implementation must
+        mirror the original find_session_anchor's `cutoff <= ts <= now` rule."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 1800, input_=100),
+                bridge_status_entry(now + 600),  # 10 min in the future
+            ])
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 100)
+            # No anchor accepted → oldest = earliest in-window usage msg
+            self.assertAlmostEqual(oldest, now - 1800, delta=1)
+
 
 class ThresholdConstantsTests(unittest.TestCase):
     def test_thresholds_picked_from_env(self):

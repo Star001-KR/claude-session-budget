@@ -200,6 +200,15 @@ def _looks_like_rate_limit(parsed):
     return False
 
 
+def _is_bridge_status(d):
+    """Structural check for the bridge_status anchor signal."""
+    return (
+        isinstance(d, dict)
+        and d.get("type") == "system"
+        and d.get("subtype") == "bridge_status"
+    )
+
+
 def find_session_anchor(now=None):
     """Latest 'session start' timestamp from jsonl bridge_status entries.
 
@@ -232,7 +241,7 @@ def find_session_anchor(now=None):
                         d = json.loads(line)
                     except Exception:
                         continue
-                    if d.get("type") != "system" or d.get("subtype") != "bridge_status":
+                    if not _is_bridge_status(d):
                         continue
                     ts = parse_ts(d.get("timestamp"))
                     if cutoff <= ts <= now and (latest is None or ts > latest):
@@ -243,12 +252,18 @@ def find_session_anchor(now=None):
 
 
 def scan_window(now=None):
-    """Scan in-window JSONL entries.
+    """Scan in-window JSONL entries (single I/O pass).
+
+    Walks each jsonl file once, collecting candidates (ts, weighted,
+    rate_limit, is_anchor) in memory; the anchor and effective cutoff are
+    decided afterward against that list. Replaces the previous double-pass
+    where find_session_anchor() and scan_window() each opened every jsonl
+    independently.
 
     Anchor logic: when a `bridge_status` entry is found within the rolling 5h
     window, its timestamp is treated as the authoritative session start —
     cutoff is raised to that point and only newer messages count. When no
-    anchor exists, falls back to the plain 5h rolling window (older behavior).
+    anchor exists, falls back to the plain 5h rolling window.
 
     Returns:
         weighted_total (int): sum of weighted usage tokens since cutoff.
@@ -259,18 +274,13 @@ def scan_window(now=None):
     """
     if now is None:
         now = time.time()
-    cutoff = now - WINDOW_SECS
-
-    anchor = find_session_anchor(now)
-    if anchor is not None and anchor > cutoff:
-        cutoff = anchor
-
+    cutoff_5h = now - WINDOW_SECS
     weights = get_weights()
 
-    entries = []
+    raw = []  # (ts, w_inc, rl, is_anchor)
     for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         try:
-            if os.path.getmtime(f) < cutoff:
+            if os.path.getmtime(f) < cutoff_5h:
                 continue
         except OSError:
             continue
@@ -282,26 +292,32 @@ def scan_window(now=None):
                     except Exception:
                         continue
                     ts = parse_ts(d.get("timestamp"))
-                    if ts < cutoff:
+                    if ts < cutoff_5h:
                         continue
+                    # Anchor must be within (cutoff_5h, now]; future-dated
+                    # bridge_status entries are not authoritative.
+                    is_anchor = _is_bridge_status(d) and ts <= now
                     u = (d.get("message") or {}).get("usage") or {}
                     w_inc = 0
                     if u:
                         w_inc = int(sum(u.get(k, 0) * w for k, w in weights.items()))
                     rl = _looks_like_rate_limit(d)
-                    if w_inc or rl:
-                        entries.append((ts, w_inc, rl))
+                    if w_inc or rl or is_anchor:
+                        raw.append((ts, w_inc, rl, is_anchor))
         except OSError:
             continue
 
-    entries.sort(key=lambda e: e[0])
+    anchor = max((ts for ts, _, _, is_a in raw if is_a), default=None)
+    cutoff = anchor if (anchor is not None and anchor > cutoff_5h) else cutoff_5h
+
+    raw.sort(key=lambda e: e[0])
 
     total = 0
-    # When we have an authoritative anchor, oldest = anchor regardless of msg ts.
-    # Otherwise, fall back to the earliest in-window usage message.
     oldest = anchor if anchor is not None else now
     events = []
-    for ts, w_inc, rl in entries:
+    for ts, w_inc, rl, _is_a in raw:
+        if ts < cutoff:
+            continue
         if w_inc:
             total += w_inc
             if anchor is None and cutoff < ts < oldest:
