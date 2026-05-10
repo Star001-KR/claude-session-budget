@@ -338,7 +338,7 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 | `scripts/session_budget_manager.py` | Full async class for PM/orchestrator integration |
 | `scripts/calibrate.py` | Manual calibration entry from a `/usage` reading |
 | `scripts/_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
-| `tests/test_budget_core.py` | Unit tests (53) — env loading, jsonl scan, anchor, signature matcher, EWMA |
+| `tests/test_budget_core.py` | Unit tests (59) — env loading, jsonl scan, anchor, signature matcher, EWMA |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |

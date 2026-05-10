@@ -208,7 +208,7 @@ running `budget_check.py` 100 times against the same event learns it once.
 ## Testing
 
 The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
-(53 tests). Each layer has its own test class:
+(59 tests). Each layer has its own test class:
 
 - `LoadEnvFileTests` — env loader semantics
 - `ParseTsTests` — timestamp parsing edge cases
