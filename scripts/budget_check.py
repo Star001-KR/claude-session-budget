@@ -25,8 +25,9 @@ from _budget_core import (
 
 
 def current_status():
-    limit = maybe_update_calibration()
-    weighted, oldest, _ = scan_window()
+    scan = scan_window()
+    limit = maybe_update_calibration(scan_result=scan)
+    weighted, oldest, _ = scan
     pct = (weighted / limit) if limit else 0.0
     return limit, weighted, oldest, pct
 
