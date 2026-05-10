@@ -382,9 +382,11 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 - Token weights are a **proxy** — Anthropic's internal formula is not public
 - **Peak hours** (weekday 5–11am PT) consume limits faster
 - **Cross-device usage** is not tracked (JSONL files are local only)
-- The `bridge_status` anchor is **intermittent**: it appears when
-  `/remote-control` activates, not on every tool call. When stale (long idle
-  gaps) the tool falls back to the plain 5h rolling window
+- **No exact server-side anchor**: we use a plain rolling-5h cutoff (see
+  [Why no `bridge_status` anchor?](#why-no-bridge_status-anchor)). The
+  reset-time estimate falls back to `earliest in-window usage ts + 5h`,
+  which lags the true server window start by however much idle time
+  preceded the first jsonl message
 - The rate-limit `api_error` signature is **conservative** — accepts both
   `status=429` and any inner `error.type` containing `rate_limit`/`usage_limit`.
   We haven't directly observed a real 429 jsonl line yet, so the exact inner
@@ -403,7 +405,7 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 | `scripts/session_budget_manager.py` | Full async class for PM/orchestrator integration |
 | `scripts/calibrate.py` | Manual calibration entry from a `/usage` reading |
 | `scripts/_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
-| `tests/test_budget_core.py` | Unit tests (59) — env loading, jsonl scan, anchor, signature matcher, EWMA |
+| `tests/test_budget_core.py` | Unit tests (86) — env loading, jsonl scan, signature matcher, EWMA, TTL-aware weighting, auto-calibration trigger, /usage parser |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |
