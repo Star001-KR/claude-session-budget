@@ -49,10 +49,23 @@ CALIBRATION_FILE = os.environ.get(
     "BUDGET_CALIBRATION_FILE", os.path.expanduser("~/.claude/.budget_calibration.json")
 )
 
+# Weights are calibrated against Anthropic's published list-price ratios
+# (https://www.anthropic.com/pricing#api). Using cost-equivalent weighting
+# matches the dollar-cost intuition behind the 5h Max session cap better
+# than naive token counting.
+#
+# Cache writes ship in two TTL flavors that price differently:
+#   - 5min default TTL  -> 1.25× base input price
+#   - 1h extended TTL   -> 2.00× base input price
+# The legacy `cache_creation_input_tokens` total has no TTL breakdown so we
+# keep it at 1.25× (the historical default and a safe lower bound for files
+# written before Claude Code added the per-TTL fields).
 DEFAULT_WEIGHTS = {
     "input_tokens": 1.0,
     "output_tokens": 5.0,
-    "cache_creation_input_tokens": 1.25,
+    "cache_creation_input_tokens": 1.25,        # legacy fallback (no TTL split)
+    "cache_creation_5m_input_tokens": 1.25,     # ephemeral_5m_input_tokens
+    "cache_creation_1h_input_tokens": 2.0,      # ephemeral_1h_input_tokens
     "cache_read_input_tokens": 0.10,
 }
 DEFAULT_LIMIT = 63_226_913
@@ -94,6 +107,33 @@ if HOOK_PAUSE_MODE not in ("block", "sleep"):
 
 HOOK_RECHECK_SECS = _env_int("BUDGET_RECHECK_SECS", "60", minimum=1)
 HOOK_RESET_GRACE_SECS = _env_int("BUDGET_RESET_GRACE_SECS", "60", minimum=0)
+
+# Auto-calibration milestones — pct thresholds at which the hook fires
+# auto_calibrate.py in the background to refine the limit estimate against
+# real `/usage` output. Each milestone fires AT MOST ONCE per 5h window.
+# Default: 80%, 90%, 95% (so 1 firing if you stop at 80%, 3 firings if you
+# push past 95%). Override with BUDGET_AUTO_CAL_MILESTONES="80,93".
+def _parse_milestones(raw):
+    out = []
+    for chunk in (raw or "").replace(";", ",").split(","):
+        chunk = chunk.strip().rstrip("%")
+        if not chunk:
+            continue
+        try:
+            v = float(chunk)
+        except ValueError:
+            continue
+        if 1 <= v <= 100:
+            out.append(v / 100)
+    return sorted(set(out)) or [0.80, 0.90, 0.95]
+
+AUTO_CAL_MILESTONES = _parse_milestones(
+    os.environ.get("BUDGET_AUTO_CAL_MILESTONES", "80,90,95")
+)
+AUTO_CAL_COOLDOWN_SECS = _env_int("BUDGET_AUTO_CAL_COOLDOWN_SECS", "300", minimum=0)
+AUTO_CAL_ENABLED = os.environ.get(
+    "BUDGET_AUTO_CAL_ENABLED", "1"
+).strip().lower() in ("1", "true", "yes")
 HOOK_MAX_SLEEP_SECS = _env_int("BUDGET_MAX_SLEEP_SECS", "14400", minimum=0)
 
 
@@ -145,6 +185,100 @@ def get_calibrated_limit():
     if isinstance(cal.get("limit"), (int, float)) and cal["limit"] > 0:
         return int(cal["limit"])
     return DEFAULT_LIMIT
+
+
+def auto_calibrate_supported():
+    """Whether auto-calibration's pty spawn can run on this platform.
+
+    POSIX (macOS, Linux): True if stdlib `pty` imports — always, in
+    practice. Windows: True iff the optional `pywinpty` package is
+    installed (`pip install pywinpty`).
+
+    The base jsonl-scan path (everything else in this module) is
+    cross-platform; only auto-calibration's `claude /usage` capture
+    needs a real pty backend.
+    """
+    import sys as _sys
+    if _sys.platform == "win32":
+        try:
+            import winpty  # noqa: F401
+            return True
+        except ImportError:
+            return False
+    try:
+        import pty  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def should_fire_auto_calibrate(pct, oldest_ts, cal=None, now=None):
+    """Decide whether the hook should kick off auto_calibrate.py.
+
+    Fires once per AUTO_CAL_MILESTONES band per 5h session window. Window
+    identity comes from `oldest_ts` (rounded to 30 min) — when the user
+    starts a fresh window, oldest_ts moves forward enough that the bucket
+    changes and milestones reset.
+
+    Cooldown semantics: `last_dispatch_ts` tracks when the hook last
+    spawned a child. Distinct from `last_success_ts` (set by the child
+    after a successful calibration) so the hook never sees its own
+    dispatch as a cooldown trigger that blocks the same dispatch.
+
+    Platform: no-op on Windows (pty unavailable). See
+    `auto_calibrate_supported()`.
+
+    Returns the milestone pct (e.g. 0.80) to fire, or None.
+    """
+    if not AUTO_CAL_ENABLED:
+        return None
+    if not auto_calibrate_supported():
+        return None  # Windows / pty-less environment
+    if os.environ.get("BUDGET_AUTO_CALIBRATE_RUNNING") == "1":
+        return None  # never fire from inside an auto-cal child
+    if cal is None:
+        cal = load_calibration()
+    if now is None:
+        now = time.time()
+
+    state = cal.get("auto_cal_state") or {}
+    last_dispatch = state.get("last_dispatch_ts") or 0
+    if now - last_dispatch < AUTO_CAL_COOLDOWN_SECS:
+        return None  # a child was recently dispatched — let it complete first
+
+    # Window key: 30-min bucket of `oldest_ts`. New 5h session shifts oldest
+    # by hours, so the bucket changes; small clock drift within one session
+    # keeps the same bucket.
+    window_key = int(oldest_ts // 1800) if oldest_ts else 0
+    fired = list(state.get("fired") or [])
+    if state.get("window_key") != window_key:
+        fired = []  # new window → milestones reset
+
+    for m in AUTO_CAL_MILESTONES:
+        if pct >= m and m not in fired:
+            return m
+    return None
+
+
+def mark_milestone_fired(milestone, oldest_ts, cal=None, now=None):
+    """Hook-side: record dispatch of `milestone` this window. Persists."""
+    if cal is None:
+        cal = load_calibration()
+    if now is None:
+        now = time.time()
+    window_key = int(oldest_ts // 1800) if oldest_ts else 0
+    state = cal.get("auto_cal_state") or {}
+    if state.get("window_key") != window_key:
+        state = {"window_key": window_key, "fired": []}
+    fired = list(state.get("fired") or [])
+    if milestone not in fired:
+        fired.append(milestone)
+    state["fired"] = sorted(fired)
+    state["last_dispatch_ts"] = now      # hook-side: when we spawned a child
+    state["window_key"] = window_key
+    cal["auto_cal_state"] = state
+    save_calibration(cal)
+    return state
 
 
 def get_weights():
@@ -206,32 +340,71 @@ def _looks_like_rate_limit(parsed):
     return False
 
 
-def _is_bridge_status(d):
-    """Structural check for the bridge_status anchor signal."""
-    return (
-        isinstance(d, dict)
-        and d.get("type") == "system"
-        and d.get("subtype") == "bridge_status"
+def compute_weighted(usage, weights=None):
+    """Compute weighted token cost for a single usage entry.
+
+    Prefers the per-TTL breakdown under `usage.cache_creation` over the
+    legacy `cache_creation_input_tokens` field — when both are present
+    (which is the normal case in current Claude Code builds), the legacy
+    flat sum equals the breakdown sum, so taking both would double-count.
+
+    Args:
+        usage: the `message.usage` dict from a jsonl entry, or None.
+        weights: optional weights override; falls back to get_weights().
+    """
+    if not usage:
+        return 0
+    if weights is None:
+        weights = get_weights()
+    total = 0.0
+    total += usage.get("input_tokens", 0) * weights.get("input_tokens", 1.0)
+    total += usage.get("output_tokens", 0) * weights.get("output_tokens", 5.0)
+    total += usage.get("cache_read_input_tokens", 0) * weights.get("cache_read_input_tokens", 0.10)
+
+    cc = usage.get("cache_creation")
+    has_breakdown = isinstance(cc, dict) and (
+        "ephemeral_5m_input_tokens" in cc or "ephemeral_1h_input_tokens" in cc
     )
+    if has_breakdown:
+        total += cc.get("ephemeral_5m_input_tokens", 0) * weights.get(
+            "cache_creation_5m_input_tokens", 1.25
+        )
+        total += cc.get("ephemeral_1h_input_tokens", 0) * weights.get(
+            "cache_creation_1h_input_tokens", 2.0
+        )
+    else:
+        # Pre-breakdown jsonl entries: fall back to the flat field.
+        total += usage.get("cache_creation_input_tokens", 0) * weights.get(
+            "cache_creation_input_tokens", 1.25
+        )
+    return int(total)
 
 
-def find_session_anchor(now=None):
-    """Latest 'session start' timestamp from jsonl bridge_status entries.
+def scan_window(now=None):
+    """Scan in-window JSONL entries (single I/O pass).
 
-    Claude Code writes a `type=system, subtype=bridge_status` line whenever
-    /remote-control becomes active — i.e. when a new session attaches to the
-    bridge. That timestamp is a strong (but intermittent) signal of when the
-    current 5h window actually began.
+    Uses a plain rolling 5h window. Earlier versions tried to anchor the
+    window on `type=system, subtype=bridge_status` entries, treating them
+    as "5h Max session start" markers — but those events fire whenever
+    `/remote-control` attaches to a new CLI session, which happens many
+    times inside one 5h window. Using them as an anchor causes the cutoff
+    to leap forward every time the user opens a new claude CLI, silently
+    resetting the budget count to ~0% mid-window. We now ignore them for
+    anchoring and only use rolling-5h + earliest in-window usage.
 
     Returns:
-        epoch seconds of the most recent in-window bridge_status, or None
-        if no signal is found in the last 5h. Callers should fall back to
-        their own rolling-window estimate when None.
+        weighted_total (int): sum of weighted usage tokens since cutoff.
+        oldest_usage_ts (float): earliest in-window usage message ts.
+            Reset time = oldest_usage_ts + WINDOW_SECS. Falls back to
+            `now` when there is no in-window usage activity.
+        rate_limit_events (list[(ts, weighted_at_event)]).
     """
     if now is None:
         now = time.time()
     cutoff = now - WINDOW_SECS
-    latest = None
+    weights = get_weights()
+
+    raw = []  # (ts, w_inc, rl)
     for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         try:
             if os.path.getmtime(f) < cutoff:
@@ -241,92 +414,30 @@ def find_session_anchor(now=None):
         try:
             with open(f, errors="ignore") as fh:
                 for line in fh:
-                    if "bridge_status" not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    if not _is_bridge_status(d):
-                        continue
-                    ts = parse_ts(d.get("timestamp"))
-                    if cutoff <= ts <= now and (latest is None or ts > latest):
-                        latest = ts
-        except OSError:
-            continue
-    return latest
-
-
-def scan_window(now=None):
-    """Scan in-window JSONL entries (single I/O pass).
-
-    Walks each jsonl file once, collecting candidates (ts, weighted,
-    rate_limit, is_anchor) in memory; the anchor and effective cutoff are
-    decided afterward against that list. Replaces the previous double-pass
-    where find_session_anchor() and scan_window() each opened every jsonl
-    independently.
-
-    Anchor logic: when a `bridge_status` entry is found within the rolling 5h
-    window, its timestamp is treated as the authoritative session start —
-    cutoff is raised to that point and only newer messages count. When no
-    anchor exists, falls back to the plain 5h rolling window.
-
-    Returns:
-        weighted_total (int): sum of weighted usage tokens since cutoff.
-        oldest_usage_ts (float): effective session start ts. Equal to the
-            anchor when one is found; otherwise the earliest in-window usage
-            message ts. Reset time = oldest_usage_ts + WINDOW_SECS.
-        rate_limit_events (list[(ts, weighted_at_event)]).
-    """
-    if now is None:
-        now = time.time()
-    cutoff_5h = now - WINDOW_SECS
-    weights = get_weights()
-
-    raw = []  # (ts, w_inc, rl, is_anchor)
-    for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
-        try:
-            if os.path.getmtime(f) < cutoff_5h:
-                continue
-        except OSError:
-            continue
-        try:
-            with open(f, errors="ignore") as fh:
-                for line in fh:
                     try:
                         d = json.loads(line)
                     except Exception:
                         continue
                     ts = parse_ts(d.get("timestamp"))
-                    if ts < cutoff_5h:
+                    if ts < cutoff:
                         continue
-                    # Anchor must be within (cutoff_5h, now]; future-dated
-                    # bridge_status entries are not authoritative.
-                    is_anchor = _is_bridge_status(d) and ts <= now
                     u = (d.get("message") or {}).get("usage") or {}
-                    w_inc = 0
-                    if u:
-                        w_inc = int(sum(u.get(k, 0) * w for k, w in weights.items()))
+                    w_inc = compute_weighted(u, weights) if u else 0
                     rl = _looks_like_rate_limit(d)
-                    if w_inc or rl or is_anchor:
-                        raw.append((ts, w_inc, rl, is_anchor))
+                    if w_inc or rl:
+                        raw.append((ts, w_inc, rl))
         except OSError:
             continue
-
-    anchor = max((ts for ts, _, _, is_a in raw if is_a), default=None)
-    cutoff = anchor if (anchor is not None and anchor > cutoff_5h) else cutoff_5h
 
     raw.sort(key=lambda e: e[0])
 
     total = 0
-    oldest = anchor if anchor is not None else now
+    oldest = now
     events = []
-    for ts, w_inc, rl, _is_a in raw:
-        if ts < cutoff:
-            continue
+    for ts, w_inc, rl in raw:
         if w_inc:
             total += w_inc
-            if anchor is None and cutoff < ts < oldest:
+            if cutoff < ts < oldest:
                 oldest = ts
         if rl:
             events.append((ts, total))

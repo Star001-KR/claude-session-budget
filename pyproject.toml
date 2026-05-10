@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-budget"
-version = "1.1.3"
+version = "1.2.0"
 description = "Track Claude Code's 5-hour session usage from local JSONL and pause tool calls before hitting the limit. No API calls, no network."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,6 +29,14 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 
+[project.optional-dependencies]
+# Windows-only: enables auto-calibration's `claude /usage` capture on
+# Windows. POSIX users don't need this — stdlib `pty` covers them.
+# Install via:  pip install "claude-session-budget[windows]"
+windows = [
+    'pywinpty >= 2.0; sys_platform == "win32"',
+]
+
 [project.urls]
 Homepage = "https://github.com/Star001-KR/claude-session-budget"
 Repository = "https://github.com/Star001-KR/claude-session-budget"
@@ -37,6 +45,7 @@ Issues = "https://github.com/Star001-KR/claude-session-budget/issues"
 [project.scripts]
 budget-check = "claude_session_budget.budget_check:main"
 budget-calibrate = "claude_session_budget.calibrate:main"
+budget-auto-calibrate = "claude_session_budget.auto_calibrate:main"
 
 [tool.setuptools]
 package-dir = {"claude_session_budget" = "scripts"}

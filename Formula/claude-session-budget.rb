@@ -1,8 +1,8 @@
 class ClaudeSessionBudget < Formula
   desc "Track Claude Code's 5-hour session usage and pause before hitting the limit"
   homepage "https://github.com/Star001-KR/claude-session-budget"
-  url "https://github.com/Star001-KR/claude-session-budget/archive/refs/tags/v1.1.3.tar.gz"
-  sha256 "5c790421e359f297a0c7d79fb5b7cd957e70001a3e9240b687b78320d4b4f437"
+  url "https://github.com/Star001-KR/claude-session-budget/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "python@3.13"
@@ -13,8 +13,9 @@ class ClaudeSessionBudget < Formula
     python = Formula["python@3.13"].opt_bin/"python3.13"
 
     {
-      "budget-check"     => "budget_check.py",
-      "budget-calibrate" => "calibrate.py",
+      "budget-check"          => "budget_check.py",
+      "budget-calibrate"      => "calibrate.py",
+      "budget-auto-calibrate" => "auto_calibrate.py",
     }.each do |cmd, script|
       (bin/cmd).write <<~BASH
         #!/bin/bash

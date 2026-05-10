@@ -16,11 +16,8 @@ Claude Code enforces a **rolling 5-hour session limit**. When running automated 
 flowchart TD
     A([You run a task in Claude Code]) --> B[Claude Code logs API response<br/>to local JSONL]
     B --> C[budget_check.py hook<br/>fires before next tool call]
-    C --> D[find_session_anchor:<br/>scan for bridge_status ts]
-    D -->|anchor found| E1[cutoff = anchor ts<br/>only post-anchor msgs count]
-    D -->|no anchor| E2[cutoff = now − 5h<br/>plain rolling window]
-    E1 --> F[Sum weighted tokens after cutoff]
-    E2 --> F
+    C --> D[scan_window:<br/>cutoff = now − 5h]
+    D --> F[Sum TTL-aware weighted tokens<br/>over all in-window jsonl entries]
     F --> G{Usage % vs<br/>calibrated limit}
     G -->|&lt; 80%| H([✓ Proceed<br/>logs % to stderr])
     G -->|80–93%| I([⟳ Proceed + log sync notice])
@@ -33,32 +30,43 @@ Claude Code writes every API response to local JSONL files:
 
 Each assistant message contains token counts in a `usage` field. By summing these with pricing-ratio weights and calibrating against one `/usage` observation, we estimate session usage in real time.
 
-### Session Anchor (`bridge_status`)
+### Why no `bridge_status` anchor?
 
-A pure 5-hour rolling window over-counts when older sessions linger in jsonl.
-Claude Code records a `type=system, subtype=bridge_status` line whenever
-`/remote-control` activates — a strong signal that a new active session has
-begun.
+Earlier versions used `type=system, subtype=bridge_status` lines as a "5h
+session start" anchor. That turned out to be wrong: Claude Code emits a
+`bridge_status` whenever `/remote-control` attaches to a *new CLI session*,
+not when the underlying 5h Max window begins. Real users open `claude` many
+times within one 5h window, so anchoring on the most recent `bridge_status`
+silently leapt the cutoff forward and reset the budget count to ~0%
+mid-window. We now use a plain rolling-5h cutoff and ignore `bridge_status`
+entirely.
 
-`find_session_anchor()` looks for the most recent `bridge_status` ts inside
-the rolling 5h window. When found, the scan cutoff is **raised to that ts**
-and only newer messages count toward the budget. The next reset estimate
-becomes `anchor + 5h`, which lines up with Anthropic's `/usage` reset time
-within minutes.
+This means we cannot pinpoint the exact moment Anthropic's server-side 5h
+window started — the rolling-5h estimate is off by however much idle time
+preceded the earliest in-window jsonl message. In practice that's usually
+a few minutes; the fallback `oldest = earliest in-window usage ts` keeps
+the reset-time estimate within the same ballpark as `/usage`.
 
-When no anchor is present (idle gaps, tool restarts), the logic falls back to
-the plain 5h rolling window — same behavior as before. The anchor is
-intermittent by design; the fallback keeps the tool useful even when the
-signal is stale.
+### Token Weighting (cost-equivalent, input = 1.0)
 
-### Token Weighting (Opus pricing, input = 1.0)
+Weights mirror Anthropic's published list-price ratios so the weighted
+total approximates dollar cost — the dimension the 5h Max cap actually
+tracks.
 
-| Token Type | Weight |
-|---|---|
-| input_tokens | 1.00× |
-| cache_creation_input_tokens | 1.25× |
-| cache_read_input_tokens | 0.10× |
-| output_tokens | 5.00× |
+| Token Type | Weight | Notes |
+|---|---|---|
+| input_tokens | 1.00× | base |
+| output_tokens | 5.00× | |
+| cache_read_input_tokens | 0.10× | |
+| `cache_creation.ephemeral_5m_input_tokens` | 1.25× | default cache TTL |
+| `cache_creation.ephemeral_1h_input_tokens` | **2.00×** | extended cache TTL |
+| `cache_creation_input_tokens` (legacy) | 1.25× | fallback when no TTL breakdown |
+
+The per-TTL breakdown landed in newer Claude Code builds; older jsonl
+entries that only carry the flat `cache_creation_input_tokens` field are
+weighted at 1.25× (the historical default and a safe lower bound). When
+both fields are present in the same entry, the breakdown supersedes the
+legacy field to avoid double-counting.
 
 ### Calibration
 
@@ -84,12 +92,56 @@ The calibrated limit is **auto-learned** from real Anthropic API errors:
 You can also seed/refine the limit manually with one `/usage` reading:
 
 ```bash
+# Mode A — explicit percentage
 python3 scripts/calibrate.py --observed-pct 67
+
+# Mode B — paste the full /usage panel; we extract the % for you
+pbpaste | python3 scripts/calibrate.py --from-stdin
 ```
 
 Known baselines (used until auto-learning kicks in):
 - **Claude Max (5x):** ~63,226,913 weighted tokens = 100% (measured 2026-05-09)
 - **Claude Pro:** unknown — contributions welcome
+
+### Background auto-calibration (zero user input)
+
+| Platform | Backend | Out-of-the-box |
+|---|---|---|
+| macOS / Linux | stdlib `pty` + `subprocess.Popen` | ✅ works as-is |
+| Windows | `pywinpty` (ConPTY wrapper) | ⚙️ `pip install pywinpty` once |
+
+On Windows without `pywinpty`, [`auto_calibrate_supported()`](scripts/_budget_core.py)
+returns False and the hook silently skips dispatch — the base jsonl-scan
+estimation still works, you just lose the periodic server-truth refinement.
+Either install pywinpty (`pip install "claude-session-budget[windows]"`)
+or use the manual `--from-stdin` path above.
+
+The hook runs [`auto_calibrate.py`](scripts/auto_calibrate.py) in the
+background when `pct` first crosses each milestone in `BUDGET_AUTO_CAL_MILESTONES`
+(default `80,90,95`). The worker:
+
+1. Spawns `claude` under a pseudo-terminal so slash commands work.
+2. Sends `/usage` once the input prompt renders.
+3. Captures the panel, ANSI-strips, parses the `Current session NN%` row.
+4. EWMA-merges into the calibration file and exits.
+
+Designed to need **zero user interaction** — no copy-paste, no extra terminal.
+Cooldown of `BUDGET_AUTO_CAL_COOLDOWN_SECS` (default 300s) prevents bursts;
+each milestone fires AT MOST once per 5h window. Worst case: 3 spawns per
+window, each adding one `claude` startup's worth of cache-write tokens.
+
+Disable entirely with `BUDGET_AUTO_CAL_ENABLED=0`. Inspect activity:
+
+```bash
+tail -20 ~/.claude/.budget_auto_calibrate.log
+```
+
+Manual one-shot run (useful for smoke-testing the spawn pipeline under
+limit):
+
+```bash
+python3 scripts/auto_calibrate.py
+```
 
 ## Installation
 

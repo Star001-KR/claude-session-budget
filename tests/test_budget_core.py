@@ -37,6 +37,10 @@ def reload_core(env_overrides):
         "BUDGET_MAX_SLEEP_SECS",
         "BUDGET_EWMA_ALPHA",
         "BUDGET_LOAD_PROJECT_ENV",
+        "BUDGET_AUTO_CAL_ENABLED",
+        "BUDGET_AUTO_CAL_MILESTONES",
+        "BUDGET_AUTO_CAL_COOLDOWN_SECS",
+        "BUDGET_AUTO_CALIBRATE_RUNNING",
     ]
     for k in keys:
         os.environ.pop(k, None)
@@ -58,19 +62,31 @@ def write_jsonl(path, entries):
     os.utime(path, None)
 
 
-def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0):
+def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0,
+                cache_create_5m=None, cache_create_1h=None):
+    """Build a synthetic usage entry.
+
+    `cache_create` is the legacy flat field; `cache_create_5m` and
+    `cache_create_1h` populate the per-TTL breakdown that newer Claude
+    Code builds emit. Pass either form (or both, in which case the
+    legacy total should equal the breakdown sum, mirroring real jsonl).
+    """
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    usage = {
+        "input_tokens": input_,
+        "output_tokens": output,
+        "cache_creation_input_tokens": cache_create,
+        "cache_read_input_tokens": cache_read,
+    }
+    if cache_create_5m is not None or cache_create_1h is not None:
+        usage["cache_creation"] = {
+            "ephemeral_5m_input_tokens": cache_create_5m or 0,
+            "ephemeral_1h_input_tokens": cache_create_1h or 0,
+        }
     return {
         "timestamp": ts,
-        "message": {
-            "usage": {
-                "input_tokens": input_,
-                "output_tokens": output,
-                "cache_creation_input_tokens": cache_create,
-                "cache_read_input_tokens": cache_read,
-            }
-        },
+        "message": {"usage": usage},
     }
 
 
@@ -608,45 +624,104 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
             self.assertEqual(len(cal["history"]), 1)  # not duplicated
 
 
-class FindSessionAnchorTests(unittest.TestCase):
-    def _setup(self, tmp, entries):
-        projects = os.path.join(tmp, "p")
-        os.makedirs(projects, exist_ok=True)
-        write_jsonl(os.path.join(projects, "x", "s.jsonl"), entries)
-        return reload_core({
-            "BUDGET_PROJECTS_DIR": projects,
-            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
-        })
+class ComputeWeightedTests(unittest.TestCase):
+    """compute_weighted: TTL-aware cache_creation accounting.
 
-    def test_returns_none_when_no_bridge_status(self):
-        with TemporaryDirectory() as tmp:
-            now = time.time()
-            core = self._setup(tmp, [usage_entry(now - 60, input_=100)])
-            self.assertIsNone(core.find_session_anchor(now=now))
+    Anthropic prices 1h-TTL cache writes at 2.0× base input price vs 1.25×
+    for the default 5m TTL. The legacy flat `cache_creation_input_tokens`
+    field doesn't expose this distinction, so when the per-TTL breakdown
+    is present we must consume it (and not double-count by also applying
+    the legacy field's weight)."""
 
-    def test_returns_latest_in_window(self):
-        with TemporaryDirectory() as tmp:
-            now = time.time()
-            core = self._setup(tmp, [
-                bridge_status_entry(now - 3000),
-                bridge_status_entry(now - 600),    # latest — should win
-                bridge_status_entry(now - 1800),
-            ])
-            anchor = core.find_session_anchor(now=now)
-            self.assertIsNotNone(anchor)
-            self.assertAlmostEqual(anchor, now - 600, delta=1)
+    def _core(self):
+        return reload_core({})
 
-    def test_ignores_out_of_window(self):
-        with TemporaryDirectory() as tmp:
-            now = time.time()
-            core = self._setup(tmp, [
-                bridge_status_entry(now - (5 * 3600 + 200)),  # outside window
-                usage_entry(now - 60, input_=100),            # keeps mtime fresh
-            ])
-            self.assertIsNone(core.find_session_anchor(now=now))
+    def test_basic_input_output_only(self):
+        core = self._core()
+        u = {"input_tokens": 100, "output_tokens": 10}
+        # 100*1 + 10*5 = 150
+        self.assertEqual(core.compute_weighted(u), 150)
+
+    def test_legacy_cache_creation_uses_125x(self):
+        core = self._core()
+        u = {"cache_creation_input_tokens": 1000}
+        self.assertEqual(core.compute_weighted(u), 1250)
+
+    def test_ttl_breakdown_5m_uses_125x(self):
+        core = self._core()
+        u = {"cache_creation": {"ephemeral_5m_input_tokens": 1000,
+                                 "ephemeral_1h_input_tokens": 0}}
+        self.assertEqual(core.compute_weighted(u), 1250)
+
+    def test_ttl_breakdown_1h_uses_2x(self):
+        core = self._core()
+        u = {"cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                 "ephemeral_1h_input_tokens": 1000}}
+        self.assertEqual(core.compute_weighted(u), 2000)
+
+    def test_breakdown_present_supersedes_legacy_field(self):
+        """When both are present (real Claude Code behavior), weight only the
+        breakdown. Otherwise we'd double-count: legacy (1.25× × 1000) PLUS
+        breakdown (2.0× × 1000) = 3250, which is wrong."""
+        core = self._core()
+        u = {
+            "cache_creation_input_tokens": 1000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                               "ephemeral_1h_input_tokens": 1000},
+        }
+        # Should be 2000 (1h-only), NOT 3250
+        self.assertEqual(core.compute_weighted(u), 2000)
+
+    def test_cache_read_uses_010x(self):
+        core = self._core()
+        u = {"cache_read_input_tokens": 10_000}
+        self.assertEqual(core.compute_weighted(u), 1000)
+
+    def test_full_realistic_entry(self):
+        """Mirrors a real Claude Code usage entry — input + output + 1h cache
+        write + cache read — to verify all four contributions sum correctly."""
+        core = self._core()
+        u = {
+            "input_tokens": 6,
+            "output_tokens": 29,
+            "cache_read_input_tokens": 18_192,
+            "cache_creation_input_tokens": 39_923,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                               "ephemeral_1h_input_tokens": 39_923},
+        }
+        # 6*1 + 29*5 + 18192*0.10 + 39923*2.0
+        # = 6 + 145 + 1819.2 + 79846 = 81816.2 → int 81816
+        self.assertEqual(core.compute_weighted(u), 81816)
+
+    def test_empty_or_none_returns_zero(self):
+        core = self._core()
+        self.assertEqual(core.compute_weighted(None), 0)
+        self.assertEqual(core.compute_weighted({}), 0)
+
+    def test_partial_breakdown_dict_treated_as_breakdown(self):
+        """A breakdown dict missing one TTL key is still TTL-aware — the
+        absent key counts as zero, and we must NOT silently fall back to
+        the legacy field (which would then double-count when present)."""
+        core = self._core()
+        u = {
+            "cache_creation_input_tokens": 500,
+            "cache_creation": {"ephemeral_5m_input_tokens": 500},  # 1h missing
+        }
+        self.assertEqual(core.compute_weighted(u), 625)  # 500*1.25, no double-count
 
 
 class ScanWindowAnchorTests(unittest.TestCase):
+    """scan_window: bridge_status entries must NOT influence the cutoff.
+
+    Earlier versions treated `type=system, subtype=bridge_status` as a
+    "5h Max session start" anchor, but those events fire on every CLI
+    attach to /remote-control — multiple times within a single 5h window
+    in normal use. Using them as an anchor caused the cutoff to leap
+    forward whenever the user opened a new claude CLI, silently zeroing
+    the budget mid-window. We now use plain rolling-5h with no anchor
+    promotion, and these tests pin the new behaviour as a regression
+    guard against re-introducing the anchor."""
+
     def _setup(self, tmp, entries):
         projects = os.path.join(tmp, "p")
         os.makedirs(projects, exist_ok=True)
@@ -656,21 +731,21 @@ class ScanWindowAnchorTests(unittest.TestCase):
             "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
         })
 
-    def test_anchor_used_as_cutoff(self):
-        """Messages before the bridge_status anchor must be excluded."""
+    def test_bridge_status_does_not_truncate_window(self):
+        """Pre-bridge_status usage MUST still be counted — that's the bug fix."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             core = self._setup(tmp, [
-                usage_entry(now - 7200, input_=100_000),   # pre-anchor: ignored
-                bridge_status_entry(now - 3600),           # anchor
-                usage_entry(now - 1800, input_=10),        # post-anchor: counted
+                usage_entry(now - 7200, input_=100_000),   # pre-bridge: counted now
+                bridge_status_entry(now - 3600),           # ignored as anchor
+                usage_entry(now - 1800, input_=10),
             ])
             total, oldest, _ = core.scan_window(now=now)
-            self.assertEqual(total, 10)
-            self.assertAlmostEqual(oldest, now - 3600, delta=1)
+            self.assertEqual(total, 100_010)               # both usages counted
+            self.assertAlmostEqual(oldest, now - 7200, delta=1)
 
-    def test_no_anchor_falls_back_to_window(self):
-        """Without bridge_status, behavior matches the old rolling-window logic."""
+    def test_plain_rolling_window(self):
+        """Without bridge_status, rolling-5h: count everything in (-5h, now]."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             core = self._setup(tmp, [
@@ -679,44 +754,46 @@ class ScanWindowAnchorTests(unittest.TestCase):
             ])
             total, oldest, _ = core.scan_window(now=now)
             self.assertEqual(total, 110)
-            # oldest should be the earliest in-window usage msg
             self.assertAlmostEqual(oldest, now - 7200, delta=1)
 
-    def test_oldest_returns_anchor_even_if_no_post_anchor_usage(self):
-        """If anchor is set but no usage messages after it, oldest = anchor."""
+    def test_no_usage_oldest_is_now(self):
+        """If no in-window usage exists, oldest defaults to `now` so reset
+        time = now + 5h (effectively 'fresh window'). bridge_status alone
+        does NOT seed oldest."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             core = self._setup(tmp, [
-                usage_entry(now - 7200, input_=500),       # pre-anchor: ignored
+                usage_entry(now - 7200, input_=500),       # outside-ish but still in 5h window
                 bridge_status_entry(now - 60),
             ])
             total, oldest, _ = core.scan_window(now=now)
-            self.assertEqual(total, 0)
-            self.assertAlmostEqual(oldest, now - 60, delta=1)
+            # 7200s = 2h, which IS within 5h, so it counts
+            self.assertEqual(total, 500)
+            self.assertAlmostEqual(oldest, now - 7200, delta=1)
 
-    def test_pre_anchor_rate_limit_event_excluded_from_events(self):
-        """A rate-limit api_error before the anchor must not appear in events.
-        The anchor authoritatively raises the cutoff; pre-anchor rate-limit
-        signatures cannot influence calibration. Regression guard for the
-        single-pass refactor — the anchor is now decided after raw collection,
-        so the cutoff filter must still drop pre-anchor rate-limit lines."""
+    def test_rate_limit_event_within_window_captured(self):
+        """A rate-limit api_error within the rolling 5h must produce an event
+        regardless of bridge_status presence."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             core = self._setup(tmp, [
-                usage_entry(now - 7200, input_=10_000),       # pre-anchor usage
-                api_error_entry(now - 5400, status=429),      # pre-anchor 429
-                bridge_status_entry(now - 3600),              # anchor
-                usage_entry(now - 1800, input_=10),           # post-anchor
+                usage_entry(now - 7200, input_=10_000),
+                api_error_entry(now - 5400, status=429),
+                bridge_status_entry(now - 3600),           # ignored
+                usage_entry(now - 1800, input_=10),
             ])
             total, oldest, events = core.scan_window(now=now)
-            self.assertEqual(total, 10)
-            self.assertAlmostEqual(oldest, now - 3600, delta=1)
-            self.assertEqual(events, [])
+            self.assertEqual(total, 10_010)
+            self.assertAlmostEqual(oldest, now - 7200, delta=1)
+            self.assertEqual(len(events), 1)
+            ev_ts, weighted_at_event = events[0]
+            self.assertAlmostEqual(weighted_at_event, 10_000)
+            self.assertAlmostEqual(ev_ts, now - 5400, delta=1)
 
-    def test_future_bridge_status_not_used_as_anchor(self):
-        """A bridge_status with ts > now (clock skew, replayed line) must
-        not be promoted to anchor. The single-pass implementation must
-        mirror the original find_session_anchor's `cutoff <= ts <= now` rule."""
+    def test_future_bridge_status_no_effect(self):
+        """A bridge_status with ts > now (clock skew, replayed line) is
+        already harmless — bridge_status is no longer used for anchoring,
+        so the rolling-5h count proceeds unaffected."""
         with TemporaryDirectory() as tmp:
             now = time.time()
             core = self._setup(tmp, [
@@ -725,8 +802,27 @@ class ScanWindowAnchorTests(unittest.TestCase):
             ])
             total, oldest, _ = core.scan_window(now=now)
             self.assertEqual(total, 100)
-            # No anchor accepted → oldest = earliest in-window usage msg
             self.assertAlmostEqual(oldest, now - 1800, delta=1)
+
+    def test_multiple_bridge_status_within_window_no_effect(self):
+        """Real failure mode: user opens claude CLI several times within one
+        5h window. Each attach writes a bridge_status. The previous
+        implementation took max() of these as the cutoff, dropping all
+        earlier usage. Pin that this is no longer the case."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._setup(tmp, [
+                usage_entry(now - 14_000, input_=5_000),    # 3.9h ago
+                bridge_status_entry(now - 14_000),           # CLI open #1
+                usage_entry(now - 7_000, input_=3_000),
+                bridge_status_entry(now - 3_600),            # CLI open #2 (would be old anchor)
+                usage_entry(now - 1_800, input_=2_000),
+                bridge_status_entry(now - 60),               # CLI open #3 (would be newer anchor)
+            ])
+            total, oldest, _ = core.scan_window(now=now)
+            # All three usage entries should count — none dropped by anchor leap.
+            self.assertEqual(total, 10_000)
+            self.assertAlmostEqual(oldest, now - 14_000, delta=1)
 
 
 class ThresholdConstantsTests(unittest.TestCase):
@@ -814,6 +910,267 @@ class ThresholdConstantsTests(unittest.TestCase):
         core = reload_core({"BUDGET_SYNC_PCT": "85", "BUDGET_PAUSE_PCT": "85"})
         self.assertAlmostEqual(core.THRESHOLD_SYNC, 0.85)
         self.assertAlmostEqual(core.THRESHOLD_PAUSE, 0.85)
+
+
+class AutoCalibrateTriggerTests(unittest.TestCase):
+    """should_fire_auto_calibrate / mark_milestone_fired: gate the
+    background auto_calibrate.py invocation. Each milestone fires AT MOST
+    once per 5h session window, with a hard cooldown so transient hook
+    bursts don't dispatch multiple workers."""
+
+    def _core_with_cal(self, tmp, env=None):
+        env = env or {}
+        cf = os.path.join(tmp, "cal.json")
+        with open(cf, "w") as f:
+            json.dump({"limit": 60_000_000}, f)
+        return reload_core({
+            "BUDGET_CALIBRATION_FILE": cf,
+            "BUDGET_AUTO_CAL_COOLDOWN_SECS": "0",  # disable for unit tests
+            **env,
+        }), cf
+
+    def test_below_first_milestone_returns_none(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            now = time.time()
+            self.assertIsNone(core.should_fire_auto_calibrate(0.50, now - 1800, now=now))
+
+    def test_first_crossing_returns_lowest_milestone(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            now = time.time()
+            # 80% threshold (default first milestone)
+            self.assertEqual(core.should_fire_auto_calibrate(0.85, now - 1800, now=now), 0.80)
+
+    def test_already_fired_milestone_skipped(self):
+        with TemporaryDirectory() as tmp:
+            core, cf = self._core_with_cal(tmp)
+            now = time.time()
+            oldest = now - 1800
+            core.mark_milestone_fired(0.80, oldest, now=now)
+            # 85% — still in the 80% band, no new milestone
+            self.assertIsNone(core.should_fire_auto_calibrate(0.85, oldest, now=now))
+
+    def test_progresses_through_milestones(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            now = time.time()
+            oldest = now - 1800
+            core.mark_milestone_fired(0.80, oldest, now=now)
+            # Now at 91% — next milestone is 90%
+            self.assertEqual(core.should_fire_auto_calibrate(0.91, oldest, now=now), 0.90)
+            core.mark_milestone_fired(0.90, oldest, now=now)
+            # Now at 96% — next is 95%
+            self.assertEqual(core.should_fire_auto_calibrate(0.96, oldest, now=now), 0.95)
+            core.mark_milestone_fired(0.95, oldest, now=now)
+            # All milestones fired in this window — nothing left to fire
+            self.assertIsNone(core.should_fire_auto_calibrate(0.99, oldest, now=now))
+
+    def test_new_window_resets_fired_milestones(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            now = time.time()
+            oldest_1 = now - 1800
+            core.mark_milestone_fired(0.80, oldest_1, now=now)
+            # New window: oldest moves forward by several hours
+            oldest_2 = now + 10_000  # any value yielding a different 30-min bucket
+            self.assertEqual(
+                core.should_fire_auto_calibrate(0.81, oldest_2, now=now), 0.80
+            )
+
+    def test_cooldown_blocks_back_to_back_firing(self):
+        with TemporaryDirectory() as tmp:
+            core, cf = self._core_with_cal(tmp, env={"BUDGET_AUTO_CAL_COOLDOWN_SECS": "300"})
+            now = time.time()
+            oldest = now - 1800
+            # Pretend a dispatch happened 10s ago — child not yet finished
+            with open(cf) as fh:
+                cal = json.load(fh)
+            cal["auto_cal_state"] = {"window_key": int(oldest // 1800),
+                                      "fired": [], "last_dispatch_ts": now - 10}
+            with open(cf, "w") as fh:
+                json.dump(cal, fh)
+            self.assertIsNone(core.should_fire_auto_calibrate(0.91, oldest, now=now))
+
+    def test_mark_milestone_records_dispatch_time(self):
+        """mark_milestone_fired sets last_dispatch_ts (hook-side cooldown
+        anchor), NOT last_success_ts (which is the child's job).
+        Regression guard: an earlier version mixed these and the child
+        process saw its own dispatch as a cooldown trigger and bailed."""
+        with TemporaryDirectory() as tmp:
+            core, cf = self._core_with_cal(tmp)
+            now = time.time()
+            oldest = now - 1800
+            core.mark_milestone_fired(0.80, oldest, now=now)
+            with open(cf) as fh:
+                cal = json.load(fh)
+            state = cal["auto_cal_state"]
+            self.assertIn("last_dispatch_ts", state)
+            self.assertNotIn("last_success_ts", state)
+            self.assertAlmostEqual(state["last_dispatch_ts"], now, delta=1)
+
+    def test_recursion_guard_disables_firing(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp, env={"BUDGET_AUTO_CALIBRATE_RUNNING": "1"})
+            now = time.time()
+            self.assertIsNone(core.should_fire_auto_calibrate(0.95, now - 1800, now=now))
+
+    def test_disabled_via_env(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp, env={"BUDGET_AUTO_CAL_ENABLED": "0"})
+            now = time.time()
+            self.assertIsNone(core.should_fire_auto_calibrate(0.95, now - 1800, now=now))
+
+    def test_custom_milestones_via_env(self):
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp, env={"BUDGET_AUTO_CAL_MILESTONES": "70,93"})
+            now = time.time()
+            # 70% should now fire
+            self.assertEqual(core.should_fire_auto_calibrate(0.72, now - 1800, now=now), 0.70)
+
+    def test_auto_calibrate_supported_on_posix(self):
+        """On POSIX `auto_calibrate_supported()` is True (pty stdlib always
+        present). On Windows the answer depends on pywinpty install — see
+        `test_auto_calibrate_supported_on_windows_with_winpty`."""
+        if sys.platform == "win32":
+            self.skipTest("posix-only check")
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            self.assertTrue(core.auto_calibrate_supported())
+
+    def test_auto_calibrate_supported_on_windows_with_winpty(self):
+        """When sys.platform spoofs win32 AND a winpty module is importable,
+        the gate must return True. We inject a stub `winpty` module into
+        sys.modules to simulate a successful `pip install pywinpty`."""
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            import types
+            saved_platform = sys.platform
+            saved_winpty = sys.modules.get("winpty")
+            try:
+                sys.platform = "win32"
+                stub = types.ModuleType("winpty")
+                stub.PtyProcess = type("PtyProcess", (), {})
+                sys.modules["winpty"] = stub
+                self.assertTrue(core.auto_calibrate_supported())
+            finally:
+                sys.platform = saved_platform
+                if saved_winpty is None:
+                    sys.modules.pop("winpty", None)
+                else:
+                    sys.modules["winpty"] = saved_winpty
+
+    def test_auto_calibrate_supported_on_windows_without_winpty(self):
+        """When sys.platform spoofs win32 AND winpty is not importable,
+        the gate must return False so the hook skips dispatch instead of
+        spawning a worker that would crash on `import winpty`."""
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            saved_platform = sys.platform
+            saved_winpty = sys.modules.pop("winpty", None)
+            # Block re-import via sys.modules sentinel (None means "not found")
+            sys.modules["winpty"] = None  # type: ignore
+            try:
+                sys.platform = "win32"
+                self.assertFalse(core.auto_calibrate_supported())
+            finally:
+                sys.platform = saved_platform
+                sys.modules.pop("winpty", None)
+                if saved_winpty is not None:
+                    sys.modules["winpty"] = saved_winpty
+
+    def test_unsupported_platform_blocks_firing(self):
+        """When auto_calibrate_supported() returns False, no milestone
+        ever fires regardless of pct. Simulated here by monkey-patching
+        the module-level helper rather than spoofing sys.platform."""
+        with TemporaryDirectory() as tmp:
+            core, _ = self._core_with_cal(tmp)
+            original = core.auto_calibrate_supported
+            try:
+                core.auto_calibrate_supported = lambda: False
+                now = time.time()
+                self.assertIsNone(
+                    core.should_fire_auto_calibrate(0.95, now - 1800, now=now)
+                )
+            finally:
+                core.auto_calibrate_supported = original
+
+
+class ParseUsageTextTests(unittest.TestCase):
+    """calibrate.parse_usage_text: pull `Current session NN%` from pasted
+    /usage panel text. The parser has to survive ANSI escapes (TTY capture),
+    Unicode block characters in the bar, and the panel's other percentage
+    rows (Current week, Sonnet only) which must NOT be picked up."""
+
+    def _import(self):
+        # calibrate is in scripts/ alongside _budget_core; SCRIPTS_DIR is on sys.path
+        import importlib
+        if "calibrate" in sys.modules:
+            return importlib.reload(sys.modules["calibrate"])
+        import calibrate
+        return calibrate
+
+    def test_real_paste_picks_session_pct(self):
+        cal = self._import()
+        text = """  Settings  Status   Config   Usage   Stats
+
+  Current session
+  ██████████████████████████████████████████████████ 100% used
+  Resets 3:40am (Asia/Seoul)
+
+  Current week (all models)
+  █████████████████████████████████▌                 67% used
+  Resets May 11 at 5am (Asia/Seoul)
+
+  Current week (Sonnet only)
+  █                                                  2% used
+"""
+        pct, reset = cal.parse_usage_text(text)
+        self.assertEqual(pct, 100.0)
+        self.assertIn("3:40am", reset)
+
+    def test_does_not_match_weekly_row(self):
+        """If 'Current session' is missing or out of order, must not pick the
+        weekly row by accident. Returns None rather than the wrong number."""
+        cal = self._import()
+        text = """  Current week (all models)
+  ████ 67% used
+  Resets May 11 at 5am
+"""
+        pct, _ = cal.parse_usage_text(text)
+        self.assertIsNone(pct)
+
+    def test_session_row_under_heading_wins_over_weekly(self):
+        """When both blocks are present, the row right under 'Current session'
+        is chosen — never the weekly one even if it appears first in the file."""
+        cal = self._import()
+        text = """  Current session
+  ████ 23% used
+  Resets 9:15pm
+
+  Current week (all models)
+  ████████ 67% used
+"""
+        pct, _ = cal.parse_usage_text(text)
+        self.assertEqual(pct, 23.0)
+
+    def test_strips_ansi_escapes(self):
+        cal = self._import()
+        text = "\x1b[2C\x1b[5A  Current session\n  \x1b[33m█\x1b[0m 75% used\n  Resets 9:15pm\n"
+        pct, reset = cal.parse_usage_text(text)
+        self.assertEqual(pct, 75.0)
+        self.assertIn("9:15pm", reset)
+
+    def test_decimal_percentages(self):
+        cal = self._import()
+        text = "Current session\n  88.5% used\n  Resets 3:40am\n"
+        pct, _ = cal.parse_usage_text(text)
+        self.assertEqual(pct, 88.5)
+
+    def test_empty_or_garbage_returns_none(self):
+        cal = self._import()
+        self.assertEqual(cal.parse_usage_text(""), (None, None))
+        self.assertEqual(cal.parse_usage_text("hello world"), (None, None))
 
 
 if __name__ == "__main__":

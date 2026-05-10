@@ -7,34 +7,28 @@ are shaped the way they are.
 
 ## Big picture
 
-The estimator is a **four-layer pipeline** sitting between local jsonl files
-and the hook's exit code:
+The estimator is a **three-layer pipeline** sitting between local jsonl
+files and the hook's exit code:
 
 ```
 ~/.claude/projects/**/*.jsonl
         │
         ▼
   ┌────────────────────────────┐
-  │ 1. Anchor detector         │  bridge_status ts → session start
-  │    find_session_anchor()   │
+  │ 1. Window scanner          │  cutoff = now − 5h
+  │    scan_window()            │  weighted = Σ compute_weighted(usage)
   └────────────────────────────┘
         │
         ▼
   ┌────────────────────────────┐
-  │ 2. Window scanner          │  cutoff = max(now-5h, anchor)
-  │    scan_window()           │  weighted = Σ(usage × pricing weights)
-  └────────────────────────────┘
-        │
-        ▼
-  ┌────────────────────────────┐
-  │ 3. Signature matcher       │  type=system, subtype=api_error,
+  │ 2. Signature matcher       │  type=system, subtype=api_error,
   │    _looks_like_rate_limit  │  status=429 / inner type contains
   │                            │  rate_limit / usage_limit
   └────────────────────────────┘
         │
         ▼
   ┌────────────────────────────┐
-  │ 4. EWMA calibrator         │  on each new event:
+  │ 3. EWMA calibrator         │  on each new event:
   │    maybe_update_calibration│  limit ← α·observed + (1-α)·prior
   └────────────────────────────┘
         │
@@ -43,62 +37,67 @@ and the hook's exit code:
 ```
 
 Each layer is independent and can be tested in isolation. Failure of any one
-layer degrades gracefully — anchor missing falls back to plain rolling
-window, EWMA learning frozen falls back to the README baseline, etc.
+layer degrades gracefully — EWMA learning frozen falls back to the README
+baseline, malformed lines are skipped, etc.
 
-## Layer 1 — Anchor detection
+## Layer 1 — Window scan
 
-**Problem:** A pure 5-hour rolling window over-counts. If the user's day
-straddles two distinct Anthropic sessions (one ending around hour-5, a fresh
-one starting), our window naively sums both — producing 100%+ readings while
-the real `/usage` shows 1–2%.
+[`scan_window()`](../scripts/_budget_core.py) walks every jsonl in
+`PROJECTS_DIR`, filters by file mtime first (cheap), then per-line
+`timestamp >= now − 5h`. There is **no anchor logic** — the cutoff is the
+plain rolling-5h boundary.
 
-**Signal:** Claude Code writes a `type=system, subtype=bridge_status` line
-whenever `/remote-control` activates. That timestamp is a strong indicator of
-"a new session is now attached."
+### Why no `bridge_status` anchor
 
-**Behavior:** [`find_session_anchor()`](../scripts/_budget_core.py:184) returns the most
-recent in-window `bridge_status` ts, or `None` when no signal is present.
+An earlier version detected `type=system, subtype=bridge_status` entries
+and treated the most-recent one as the "session start", raising the cutoff
+to that timestamp. The reasoning was that `bridge_status` fires when
+`/remote-control` attaches and would mark a fresh 5h window.
 
-**Caveats:**
-- The signal is *intermittent*. Short tool restarts may not produce one.
-- If the user idles longer than 5h, the most recent `bridge_status` rolls out
-  of the window and we revert to plain rolling — correct behavior.
-- We do **not** apply an "anchor reset must be earlier than our estimate"
-  precedence rule. The anchor *is* the more authoritative source; second-
-  guessing it just reintroduces the bug we set out to fix.
+Reality check: `bridge_status` fires whenever Claude Code's CLI attaches
+to the remote-control bridge, which happens *every* time the user runs
+`claude` — many times within one 5h window for active users. Using
+`max(bridge_status_ts)` as anchor caused the cutoff to leap forward each
+time a new CLI session started, silently zeroing the budget mid-window.
 
-## Layer 2 — Window scan
+The current implementation ignores `bridge_status` entirely. The trade-off:
+we cannot pinpoint the server's exact 5h-window start, so our `oldest`
+(earliest in-window usage ts) lags the true anchor by however much idle
+time preceded the first jsonl message — usually a few minutes. Activity
+on other devices or `claude.ai` web is invisible to local jsonl regardless
+of any anchor strategy, so this estimator is structurally a *lower bound*
+on the server-side `/usage` number anyway.
 
-[`scan_window()`](../scripts/_budget_core.py:226) walks every jsonl in `PROJECTS_DIR`,
-filters by file mtime first (cheap), then per-line `timestamp >= cutoff`.
+### `oldest` semantics
 
-**Cutoff calculation:**
-```python
-cutoff = now - WINDOW_SECS
-anchor = find_session_anchor(now)
-if anchor is not None and anchor > cutoff:
-    cutoff = anchor   # raise the floor
-```
+Drives the reset-time estimate (`reset_at = oldest + 5h`):
+- ≥1 in-window usage entry → `oldest = earliest in-window usage ts`
+- Otherwise → `oldest = now` (effectively "fresh window")
 
-**`oldest` semantics** (drives reset estimate):
-- Anchor present → `oldest = anchor` (regardless of msg ts)
-- Anchor absent → `oldest = earliest in-window usage msg ts`
+### Token weights — TTL-aware
 
-So `reset_at = oldest + 5h` always reflects the active session's start,
-whether learned from the explicit signal or inferred from the oldest message.
+[`compute_weighted(usage)`](../scripts/_budget_core.py) maps each usage
+entry to a cost-equivalent integer using Anthropic's list-price ratios:
 
-**Token weights** are pricing-ratio multipliers (input=1.0× as base):
-| Field | Weight |
-|---|---|
-| `input_tokens` | 1.00× |
-| `cache_creation_input_tokens` | 1.25× |
-| `cache_read_input_tokens` | 0.10× |
-| `output_tokens` | 5.00× |
+| Field | Weight | Notes |
+|---|---|---|
+| `input_tokens` | 1.00× | base |
+| `output_tokens` | 5.00× | |
+| `cache_read_input_tokens` | 0.10× | |
+| `cache_creation.ephemeral_5m_input_tokens` | 1.25× | default cache TTL |
+| `cache_creation.ephemeral_1h_input_tokens` | **2.00×** | extended cache TTL |
+| `cache_creation_input_tokens` (legacy) | 1.25× | fallback when no breakdown |
 
-These derive from Anthropic's published Opus pricing. They're a *proxy* — the
-internal billing formula isn't public — but the relative ratios hold across
-model tiers.
+The flat `cache_creation_input_tokens` field equals the TTL-breakdown sum
+in current Claude Code builds, so when both are present we consume only
+the breakdown — using both would double-count the cache write. Older jsonl
+entries that pre-date the breakdown still work via the legacy 1.25×
+fallback.
+
+These weights aren't speculation about an unpublished billing formula —
+they're the published list prices. Still a proxy (the actual 5h-cap
+formula could differ), but matching dollar-cost is the most defensible
+prior we have.
 
 ## Layer 3 — Signature matcher
 
@@ -208,7 +207,7 @@ running `budget_check.py` 100 times against the same event learns it once.
 ## Testing
 
 The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
-(59 tests). Each layer has its own test class:
+(86 tests). Each layer has its own test class:
 
 - `LoadEnvFileTests` — env loader semantics
 - `ParseTsTests` — timestamp parsing edge cases
