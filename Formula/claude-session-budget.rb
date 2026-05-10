@@ -2,7 +2,7 @@ class ClaudeSessionBudget < Formula
   desc "Track Claude Code's 5-hour session usage and pause before hitting the limit"
   homepage "https://github.com/Star001-KR/claude-session-budget"
   url "https://github.com/Star001-KR/claude-session-budget/archive/refs/tags/v1.1.1.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "afe1fc2f9ed6eef9e267f9bcfcfd94fadf8e6755a52b68f469ff9b7ef16417e6"
   license "MIT"
 
   depends_on "python@3.13"
