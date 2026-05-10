@@ -24,7 +24,7 @@ flowchart TD
     G -->|≥ 93%| J[⏸ Block dispatch until<br/>5-hour session resets]
     J -.->|wait for reset| A
 
-    G -.->|first crossing of<br/>80 / 90 / 95% per window| K[fork auto_calibrate.py<br/>in background]
+    A -.->|async side effect:<br/>first time pct crosses 80 / 90 / 95%<br/>per 5h window| K[fork auto_calibrate.py<br/>in background]
     K --> L[Spawn `claude` under pty,<br/>send /usage, capture panel]
     L --> M[Parse + EWMA-merge<br/>observed % into limit]
     M -.->|refines limit<br/>for next hook firing| G
