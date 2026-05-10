@@ -52,11 +52,16 @@ DEFAULT_WEIGHTS = {
 DEFAULT_LIMIT = 63_226_913
 
 
-def _env_float(name, default):
+def _env_float(name, default, minimum=None, maximum=None):
     try:
-        return float(os.environ.get(name, default))
+        value = float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return float(default)
+    if minimum is not None and value < minimum:
+        return float(default)
+    if maximum is not None and value > maximum:
+        return float(default)
+    return value
 
 
 def _env_int(name, default, minimum=None):
@@ -69,10 +74,13 @@ def _env_int(name, default, minimum=None):
     return value
 
 
-EWMA_ALPHA = _env_float("BUDGET_EWMA_ALPHA", "0.3")
+EWMA_ALPHA = _env_float("BUDGET_EWMA_ALPHA", "0.3", minimum=0.0, maximum=1.0)
 
-THRESHOLD_SYNC = _env_float("BUDGET_SYNC_PCT", "80") / 100
-THRESHOLD_PAUSE = _env_float("BUDGET_PAUSE_PCT", "93") / 100
+THRESHOLD_SYNC = _env_float("BUDGET_SYNC_PCT", "80", minimum=1, maximum=100) / 100
+THRESHOLD_PAUSE = _env_float("BUDGET_PAUSE_PCT", "93", minimum=1, maximum=100) / 100
+if THRESHOLD_SYNC > THRESHOLD_PAUSE:
+    THRESHOLD_SYNC = 0.80
+    THRESHOLD_PAUSE = 0.93
 
 HOOK_PAUSE_MODE = os.environ.get("BUDGET_PAUSE_MODE", "block").strip().lower()
 if HOOK_PAUSE_MODE not in ("block", "sleep"):
