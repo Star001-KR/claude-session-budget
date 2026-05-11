@@ -226,7 +226,8 @@ def spawn_claude_capture_usage(timeout=SPAWN_TIMEOUT_SECS):
         return "", False
 
     output = bytearray()
-    deadline = time.time() + timeout
+    start = time.time()
+    deadline = start + timeout
     state = "wait_prompt"   # wait_prompt → wait_panel → done
     sent_usage_at = 0.0
 
@@ -254,10 +255,26 @@ def spawn_claude_capture_usage(timeout=SPAWN_TIMEOUT_SECS):
             # bail after 10s of waiting post-send so the parent doesn't
             # hang on an unexpected TUI state.
             if state == "wait_panel" and time.time() - sent_usage_at > 10:
-                _log("panel marker not seen within 10s of /usage send")
                 break
     finally:
         ptp.close()
+
+    if state != "done":
+        # Most common failure mode is TUI drift: Claude CLI output no
+        # longer contains PROMPT_MARKER / PANEL_MARKER as-is. Log enough
+        # to diagnose without re-running, plus the manual fallback path.
+        saw_prompt = PROMPT_MARKER in output
+        saw_panel = PANEL_MARKER in output
+        elapsed = time.time() - start
+        _log(
+            f"capture incomplete: state={state} saw_prompt={saw_prompt} "
+            f"saw_panel={saw_panel} bytes={len(output)} elapsed={elapsed:.1f}s "
+            f"timeout={timeout:.1f}s. "
+            f"If the Claude CLI TUI changed, PROMPT_MARKER={PROMPT_MARKER!r} "
+            f"and/or PANEL_MARKER={PANEL_MARKER!r} may no longer match. "
+            f"Fallback: run `calibrate.py --observed-pct <N>` manually. "
+            f"Output tail: {bytes(output[-400:])!r}"
+        )
 
     text = output.decode("utf-8", errors="ignore")
     return text, state == "done"
@@ -290,7 +307,7 @@ def main():
         return 1
 
     if not ok:
-        _log(f"capture incomplete; len(text)={len(text)} snippet={text[-300:]!r}")
+        # spawn_claude_capture_usage already logged the detailed failure mode.
         return 1
 
     pct, reset = parse_usage_text(text)

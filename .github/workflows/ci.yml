@@ -79,3 +79,16 @@ jobs:
             fi
           done
           echo "all versions aligned at $PY_VERSION"
+
+      - name: Verify install.sh and publish.yml agree on hook script list
+        run: |
+          set -e
+          INSTALL_LIST=$(python -c "import re; m=re.search(r'^for f in (.+?); do', open('install.sh').read(), re.M); print(' '.join(sorted(m.group(1).split())))")
+          PUBLISH_LIST=$(python -c "import re; m=re.search(r'sha256sum ([^>]+?) >', open('.github/workflows/publish.yml').read()); print(' '.join(sorted(m.group(1).split())))")
+          echo "install.sh downloads:    $INSTALL_LIST"
+          echo "publish.yml SHA256SUMS:  $PUBLISH_LIST"
+          if [ "$INSTALL_LIST" != "$PUBLISH_LIST" ]; then
+            echo "MISMATCH: install.sh download list and publish.yml SHA256SUMS generation list must agree"
+            exit 1
+          fi
+          echo "install.sh and publish.yml hook script lists match"

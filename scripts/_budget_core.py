@@ -8,10 +8,40 @@ Responsibilities:
   - Persist auto-learned calibration to ~/.claude/.budget_calibration.json.
   - Detect rate-limit events in JSONL and EWMA-update the calibrated limit.
 """
-import glob, json, os, tempfile, time
+import glob, json, os, tempfile, time, traceback
 from datetime import datetime
 
 WINDOW_SECS = 5 * 3600
+
+# Where swallowed exceptions get appended so silent hook failures
+# (corrupt calibration, unreadable env file, malformed jsonl line, …)
+# survive as on-disk tracebacks instead of vanishing.
+ERROR_LOG_PATH = os.environ.get(
+    "BUDGET_ERROR_LOG", os.path.expanduser("~/.claude/.budget_errors.log")
+)
+ERROR_LOG_MAX_BYTES = 256 * 1024
+
+
+def _log_swallowed(exc, context):
+    """Append a swallowed exception's traceback to ERROR_LOG_PATH.
+
+    Self-swallows write failures: a failed log write must not become a new
+    exception that escapes the hook into the user's tool call.
+    """
+    try:
+        if os.path.exists(ERROR_LOG_PATH) and os.path.getsize(ERROR_LOG_PATH) > ERROR_LOG_MAX_BYTES:
+            try:
+                os.rename(ERROR_LOG_PATH, ERROR_LOG_PATH + ".old")
+            except OSError:
+                pass
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+        with open(ERROR_LOG_PATH, "a") as f:
+            ts = datetime.now().isoformat(timespec="seconds")
+            f.write(f"[{ts}] {context}: {type(exc).__name__}: {exc}\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+    except Exception:
+        pass
 
 
 def _load_env_file(path):
@@ -30,8 +60,8 @@ def _load_env_file(path):
                     v = v[1:-1]
                 if k and k not in os.environ:
                     os.environ[k] = v
-    except Exception:
-        pass
+    except Exception as e:
+        _log_swallowed(e, f"_load_env_file({path!r})")
 
 
 # ~/.claude/.env is always loaded (global config under user control).
@@ -141,7 +171,10 @@ def load_calibration():
     try:
         with open(CALIBRATION_FILE) as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        _log_swallowed(e, "load_calibration")
         return {}
 
 
@@ -169,8 +202,8 @@ def save_calibration(data):
             except OSError:
                 pass
             raise
-    except Exception:
-        pass
+    except Exception as e:
+        _log_swallowed(e, "save_calibration")
 
 
 def get_calibrated_limit():
@@ -299,7 +332,8 @@ def parse_ts(v):
     if isinstance(v, str):
         try:
             return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-        except Exception:
+        except Exception as e:
+            _log_swallowed(e, f"parse_ts({v!r})")
             return 0.0
     return v / 1000 if v > 1e10 else float(v)
 
@@ -425,7 +459,7 @@ def scan_window(now=None):
                 for line in fh:
                     try:
                         d = json.loads(line)
-                    except Exception:
+                    except json.JSONDecodeError:
                         continue
                     ts = parse_ts(d.get("timestamp"))
                     if ts < cutoff:
