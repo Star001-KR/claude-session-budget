@@ -39,7 +39,7 @@ jobs:
       - name: Generate SHA256SUMS for hook scripts
         if: github.event_name == 'release'
         working-directory: scripts
-        run: sha256sum _budget_core.py budget_check.py calibrate.py > ../SHA256SUMS
+        run: sha256sum _budget_core.py budget_check.py calibrate.py auto_calibrate.py > ../SHA256SUMS
 
       - name: Upload SHA256SUMS to release
         if: github.event_name == 'release'
