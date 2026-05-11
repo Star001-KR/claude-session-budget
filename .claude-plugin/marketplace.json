@@ -10,7 +10,7 @@
       "name": "session-budget",
       "source": "./",
       "description": "Track Claude Code's 5-hour session usage from local JSONL and pause tool calls before hitting the limit.",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "category": "observability",
       "keywords": [
         "session",
