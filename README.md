@@ -377,6 +377,42 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 | `BUDGET_CALIBRATION_FILE` | `~/.claude/.budget_calibration.json` | Persistence path for auto-calibration |
 | `BUDGET_LOAD_PROJECT_ENV` | *(unset)* | Set to `1` to also load `./.env` from cwd at module import. Disabled by default to avoid an untrusted-cwd attack surface and import-time side effects |
 
+## Disable / Uninstall
+
+**Temporarily disable** (per-session): open `~/.claude/settings.json`, find the
+`PreToolUse` entry whose `command` references `budget-check` (or
+`budget_check.py`), and either remove that single entry from the array or
+restart Claude Code after editing. Re-add it to re-enable.
+
+**Full uninstall:**
+
+```bash
+# 1. Remove the hook entry from ~/.claude/settings.json
+#    Delete the {"matcher": "*", "hooks": [{... "budget-check" ...}]} entry
+#    from the "PreToolUse" array. (Leave the rest of the file alone.)
+
+# 2. Remove the package — pick the matching path:
+brew uninstall claude-session-budget                  # Option B (Homebrew)
+pip uninstall claude-session-budget                   # Option C (PyPI)
+rm -f ~/.claude/hooks/budget_check.py \
+      ~/.claude/hooks/auto_calibrate.py \
+      ~/.claude/hooks/_budget_core.py \
+      ~/.claude/hooks/calibrate.py                    # Option D (install.sh)
+
+# 3. Optional — clear auto-learned state and logs
+rm -f ~/.claude/.budget_calibration.json \
+      ~/.claude/.budget_auto_calibrate.log
+```
+
+Plugin install (Option A) uninstalls from inside Claude Code:
+
+```
+/plugin uninstall session-budget
+```
+
+If `install.sh` ever fails mid-run, it backs up your previous
+`settings.json` to `~/.claude/settings.json.bak`; restore from there.
+
 ## Limitations
 
 - Token weights are a **proxy** — Anthropic's internal formula is not public
