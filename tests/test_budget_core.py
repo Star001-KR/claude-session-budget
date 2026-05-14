@@ -868,15 +868,15 @@ class ThresholdConstantsTests(unittest.TestCase):
 
     def test_alpha_negative_falls_back_to_default(self):
         core = reload_core({"BUDGET_EWMA_ALPHA": "-0.5"})
-        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.35)
 
     def test_alpha_above_one_falls_back_to_default(self):
         core = reload_core({"BUDGET_EWMA_ALPHA": "1.5"})
-        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.35)
 
     def test_alpha_garbage_falls_back_to_default(self):
         core = reload_core({"BUDGET_EWMA_ALPHA": "not-a-number"})
-        self.assertAlmostEqual(core.EWMA_ALPHA, 0.3)
+        self.assertAlmostEqual(core.EWMA_ALPHA, 0.35)
 
     def test_alpha_boundary_values_accepted(self):
         for raw, expected in (("0", 0.0), ("1", 1.0), ("0.05", 0.05)):
@@ -939,21 +939,22 @@ class AutoCalibrateTriggerTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             core, _ = self._core_with_cal(tmp)
             now = time.time()
-            # 80% threshold (default first milestone)
-            self.assertEqual(core.should_fire_auto_calibrate(0.85, now - 1800, now=now), 0.80)
+            # 90% threshold (default sole milestone)
+            self.assertEqual(core.should_fire_auto_calibrate(0.91, now - 1800, now=now), 0.90)
 
     def test_already_fired_milestone_skipped(self):
         with TemporaryDirectory() as tmp:
             core, cf = self._core_with_cal(tmp)
             now = time.time()
             oldest = now - 1800
-            core.mark_milestone_fired(0.80, oldest, now=now)
-            # 85% — still in the 80% band, no new milestone
-            self.assertIsNone(core.should_fire_auto_calibrate(0.85, oldest, now=now))
+            core.mark_milestone_fired(0.90, oldest, now=now)
+            # 95% — only one milestone configured and it has fired
+            self.assertIsNone(core.should_fire_auto_calibrate(0.95, oldest, now=now))
 
     def test_progresses_through_milestones(self):
         with TemporaryDirectory() as tmp:
-            core, _ = self._core_with_cal(tmp)
+            # Override with multi-milestone env to verify progression semantics
+            core, _ = self._core_with_cal(tmp, env={"BUDGET_AUTO_CAL_MILESTONES": "80,90,95"})
             now = time.time()
             oldest = now - 1800
             core.mark_milestone_fired(0.80, oldest, now=now)
@@ -971,11 +972,11 @@ class AutoCalibrateTriggerTests(unittest.TestCase):
             core, _ = self._core_with_cal(tmp)
             now = time.time()
             oldest_1 = now - 1800
-            core.mark_milestone_fired(0.80, oldest_1, now=now)
+            core.mark_milestone_fired(0.90, oldest_1, now=now)
             # New window: oldest moves forward by several hours
             oldest_2 = now + 10_000  # any value yielding a different 30-min bucket
             self.assertEqual(
-                core.should_fire_auto_calibrate(0.81, oldest_2, now=now), 0.80
+                core.should_fire_auto_calibrate(0.91, oldest_2, now=now), 0.90
             )
 
     def test_cooldown_blocks_back_to_back_firing(self):
@@ -1001,7 +1002,7 @@ class AutoCalibrateTriggerTests(unittest.TestCase):
             core, cf = self._core_with_cal(tmp)
             now = time.time()
             oldest = now - 1800
-            core.mark_milestone_fired(0.80, oldest, now=now)
+            core.mark_milestone_fired(0.90, oldest, now=now)
             with open(cf) as fh:
                 cal = json.load(fh)
             state = cal["auto_cal_state"]

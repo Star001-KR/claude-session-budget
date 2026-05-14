@@ -196,7 +196,7 @@ hook fire. For each new in-window event (deduped via `seen_events`):
 new_limit = α · weighted_at_event + (1 − α) · prior_limit
 ```
 
-Default `α = 0.3`. Lower → more inertia (trust prior). Higher → trust new
+Default `α = 0.35`. Lower → more inertia (trust prior). Higher → trust new
 observation. Configurable via `BUDGET_EWMA_ALPHA`.
 
 `weighted_at_event` is the running total at the event's timestamp — i.e.

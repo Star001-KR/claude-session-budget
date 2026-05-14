@@ -24,7 +24,7 @@ flowchart TD
     G -->|≥ 93%| J[⏸ Block dispatch until<br/>5-hour session resets]
     J -.->|wait for reset| A
 
-    A -.->|async side effect:<br/>first time pct crosses 80 / 90 / 95%<br/>per 5h window| K[fork auto_calibrate.py<br/>in background]
+    A -.->|async side effect:<br/>first time pct crosses 90%<br/>per 5h window| K[fork auto_calibrate.py<br/>in background]
     K --> L[Spawn `claude` under pty,<br/>send /usage, capture panel]
     L --> M[Parse + EWMA-merge<br/>observed % into limit]
     M -.->|refines limit<br/>for next hook firing| G
@@ -39,7 +39,7 @@ divides by a calibrated limit to estimate session usage in real time. Two
 self-correction paths keep that limit honest: a structural detector for
 real `429 / rate_limit` API errors in the JSONL, and a background worker
 that drives `claude /usage` itself when the estimate first crosses each
-of `BUDGET_AUTO_CAL_MILESTONES` (default `80, 90, 95%`) — see
+of `BUDGET_AUTO_CAL_MILESTONES` (default `90%`) — see
 [Background auto-calibration](#background-auto-calibration-zero-user-input)
 below. The user never has to copy-paste anything for either path.
 
@@ -91,7 +91,7 @@ The calibrated limit is **auto-learned** from real Anthropic API errors:
    `error.type` containing `rate_limit` / `usage_limit`.
 2. When it finds a new event, it takes the weighted token total at that
    moment as a real-world `100%` reading.
-3. The stored limit is EWMA-merged with the observation (default α=0.3) and
+3. The stored limit is EWMA-merged with the observation (default α=0.35) and
    written to `~/.claude/.budget_calibration.json`.
 
 > **Why structural matching, not text?**
@@ -131,7 +131,7 @@ or use the manual `--from-stdin` path above.
 
 The hook runs [`auto_calibrate.py`](scripts/auto_calibrate.py) in the
 background when `pct` first crosses each milestone in `BUDGET_AUTO_CAL_MILESTONES`
-(default `80,90,95`). The worker:
+(default `90`). The worker:
 
 1. Spawns `claude` under a pseudo-terminal so slash commands work.
 2. Sends `/usage` once the input prompt renders.
@@ -371,7 +371,7 @@ always overrides.** `./.env` (cwd) is opt-in via `BUDGET_LOAD_PROJECT_ENV`.
 | `BUDGET_RECHECK_SECS` | `60` | sleep mode: jsonl re-scan interval |
 | `BUDGET_RESET_GRACE_SECS` | `60` | sleep mode: extra wait after threshold drop, before resume |
 | `BUDGET_MAX_SLEEP_SECS` | `14400` | sleep mode cap (4h). After this, hook gives up and exits 2 |
-| `BUDGET_EWMA_ALPHA` | `0.3` | EWMA smoothing factor for auto-learned limit |
+| `BUDGET_EWMA_ALPHA` | `0.35` | EWMA smoothing factor for auto-learned limit |
 | `BUDGET_CALIBRATED_LIMIT` | *(unset)* | Hard override of stored calibrated limit (weighted tokens) |
 | `BUDGET_PROJECTS_DIR` | `~/.claude/projects` | jsonl scan root |
 | `BUDGET_CALIBRATION_FILE` | `~/.claude/.budget_calibration.json` | Persistence path for auto-calibration |
