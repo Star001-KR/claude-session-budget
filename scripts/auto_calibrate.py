@@ -9,8 +9,8 @@ auto_calibrate.py — fire-and-forget background worker that:
    the observed % into ~/.claude/.budget_calibration.json.
 
 Invoked by budget_check.py when crossing AUTO_CAL_MILESTONES (default
-80%, 90%, 95%) for the first time in the current 5h window. Designed so
-the user never has to copy-paste anything.
+90%) for the first time in the current 5h window. Designed so the user
+never has to copy-paste anything.
 
 Recursion guard: sets BUDGET_AUTO_CALIBRATE_RUNNING=1 in the spawned
 claude env. budget_check.py honors that and short-circuits, so no
@@ -18,7 +18,7 @@ runaway nesting even if the spawned claude triggers tool calls.
 
 Token cost: each invocation is one fresh `claude` startup (system prompt
 + CLAUDE.md + MCP handshakes get cache-written). Bounded by milestone
-firing count — at most 3 invocations per 5h window by default.
+firing count — at most 1 invocation per 5h window by default.
 
 Cross-platform PTY:
 - POSIX (macOS, Linux):  stdlib `pty` + `subprocess.Popen` + `select`

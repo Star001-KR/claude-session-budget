@@ -123,7 +123,7 @@ def _env_int(name, default, minimum=None):
     return value
 
 
-EWMA_ALPHA = _env_float("BUDGET_EWMA_ALPHA", "0.3", minimum=0.0, maximum=1.0)
+EWMA_ALPHA = _env_float("BUDGET_EWMA_ALPHA", "0.35", minimum=0.0, maximum=1.0)
 
 THRESHOLD_SYNC = _env_float("BUDGET_SYNC_PCT", "80", minimum=1, maximum=100) / 100
 THRESHOLD_PAUSE = _env_float("BUDGET_PAUSE_PCT", "93", minimum=1, maximum=100) / 100
@@ -141,8 +141,10 @@ HOOK_RESET_GRACE_SECS = _env_int("BUDGET_RESET_GRACE_SECS", "60", minimum=0)
 # Auto-calibration milestones — pct thresholds at which the hook fires
 # auto_calibrate.py in the background to refine the limit estimate against
 # real `/usage` output. Each milestone fires AT MOST ONCE per 5h window.
-# Default: 80%, 90%, 95% (so 1 firing if you stop at 80%, 3 firings if you
-# push past 95%). Override with BUDGET_AUTO_CAL_MILESTONES="80,93".
+# Default: 90% only — a single calibration at the sweet spot where enough
+# weighted tokens have accumulated for an accurate reading without being
+# too close to the limit. Override with e.g. BUDGET_AUTO_CAL_MILESTONES="80,93"
+# to fire multiple times per window.
 def _parse_milestones(raw):
     out = []
     for chunk in (raw or "").replace(";", ",").split(","):
@@ -155,10 +157,10 @@ def _parse_milestones(raw):
             continue
         if 1 <= v <= 100:
             out.append(v / 100)
-    return sorted(set(out)) or [0.80, 0.90, 0.95]
+    return sorted(set(out)) or [0.90]
 
 AUTO_CAL_MILESTONES = _parse_milestones(
-    os.environ.get("BUDGET_AUTO_CAL_MILESTONES", "80,90,95")
+    os.environ.get("BUDGET_AUTO_CAL_MILESTONES", "90")
 )
 AUTO_CAL_COOLDOWN_SECS = _env_int("BUDGET_AUTO_CAL_COOLDOWN_SECS", "300", minimum=0)
 AUTO_CAL_ENABLED = os.environ.get(

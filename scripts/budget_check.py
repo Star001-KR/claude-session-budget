@@ -11,9 +11,9 @@ Config (env, ./.env, or ~/.claude/.env):
   BUDGET_RECHECK_SECS           sleep-mode recheck interval, default 60
   BUDGET_RESET_GRACE_SECS       extra recheck grace before resume, default 60
   BUDGET_MAX_SLEEP_SECS         sleep-mode cap, default 14400
-  BUDGET_EWMA_ALPHA             default 0.3
+  BUDGET_EWMA_ALPHA             default 0.35
   BUDGET_AUTO_CAL_ENABLED       1 (default) — fire auto_calibrate on milestones
-  BUDGET_AUTO_CAL_MILESTONES    "80,90,95" — pcts that trigger auto-calibration
+  BUDGET_AUTO_CAL_MILESTONES    "90" — pcts that trigger auto-calibration
   BUDGET_AUTO_CAL_COOLDOWN_SECS 300 — min seconds between auto-calibrations
 """
 import os, subprocess, sys, time
