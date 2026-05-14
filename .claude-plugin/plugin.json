@@ -1,6 +1,6 @@
 {
   "name": "session-budget",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Track Claude Code's 5-hour session usage from local JSONL and pause tool calls before hitting the limit. No API calls, no network — pure local file parsing.",
   "author": {
     "name": "Taehyung Kim",

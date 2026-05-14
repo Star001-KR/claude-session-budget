@@ -3,7 +3,7 @@ set -e
 
 # Pinned to a release tag (not `main`) so the download target is immutable.
 # CI verifies this version stays aligned with the other version-bearing files.
-TAG="v1.2.2"
+TAG="v1.2.3"
 REPO="https://raw.githubusercontent.com/Star001-KR/claude-session-budget/${TAG}"
 SUMS_URL="https://github.com/Star001-KR/claude-session-budget/releases/download/${TAG}/SHA256SUMS"
 HOOKS_DIR="$HOME/.claude/hooks"
