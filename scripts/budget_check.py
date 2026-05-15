@@ -39,16 +39,22 @@ def current_status():
 def maybe_kick_auto_calibrate(pct, oldest):
     """If a milestone is crossed, spawn auto_calibrate.py in the background.
 
-    Fire-and-forget: we mark the milestone fired *before* the spawn so a
-    burst of hook calls in the same second doesn't queue up multiple
-    children. The child runs detached and writes its own log; we don't
+    Fire-and-forget: we mark the milestone fired *before* the spawn. That
+    dedupes *sequential* hook invocations — once one process persists the
+    milestone, later hooks load it and skip. It does NOT lock out *truly
+    concurrent* hook processes (e.g. parallel tool calls): if several read
+    calibration before any of them marks, each can still spawn its own
+    child. The cost is bounded — a milestone may over-fire by a few extra
+    `claude /usage` spawns per window; an exactly-once guarantee would need
+    a file lock. The child runs detached and writes its own log; we don't
     wait for or read its output.
     """
     cal = load_calibration()
     milestone = should_fire_auto_calibrate(pct, oldest, cal=cal)
     if milestone is None:
         return
-    # Mark first to make this idempotent under concurrent hook firing.
+    # Mark before spawn — dedupes sequential hook calls (see docstring;
+    # not a lock against truly concurrent hooks).
     mark_milestone_fired(milestone, oldest, cal=cal)
 
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_calibrate.py")

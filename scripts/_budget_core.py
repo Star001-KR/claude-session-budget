@@ -34,7 +34,7 @@ def _log_swallowed(exc, context):
                 os.rename(ERROR_LOG_PATH, ERROR_LOG_PATH + ".old")
             except OSError:
                 pass
-        os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH) or ".", exist_ok=True)
         with open(ERROR_LOG_PATH, "a") as f:
             ts = datetime.now().isoformat(timespec="seconds")
             f.write(f"[{ts}] {context}: {type(exc).__name__}: {exc}\n")
@@ -189,8 +189,8 @@ def save_calibration(data):
     writers truncating each other mid-dump.
     """
     try:
-        os.makedirs(os.path.dirname(CALIBRATION_FILE), exist_ok=True)
         dirpath = os.path.dirname(CALIBRATION_FILE) or "."
+        os.makedirs(dirpath, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".budget_cal_", suffix=".tmp", dir=dirpath)
         try:
             with os.fdopen(fd, "w") as f:
