@@ -570,6 +570,13 @@ def compute_weighted(usage, weights=None):
 
 _ANCHOR_SKEW_SECS = 120  # clock-skew tolerance for the window-end range check
 
+# How far back scan_window extends its scan to feed _session_cutoff's
+# roll-forward when an anchor has expired. The roll-forward tiles sessions
+# from the anchor's window_end and needs activity history back to it; an
+# anchor whose window_end is older than this is too stale to roll forward
+# from reliably (→ rolling-5h fallback).
+_ANCHOR_ROLLFORWARD_LOOKBACK = 2 * WINDOW_SECS
+
 
 def get_session_anchor(cal=None):
     """Return (window_start, window_end) from the stored /usage anchor,
@@ -614,7 +621,7 @@ def save_session_anchor(window_end, now=None):
     return True
 
 
-def _session_cutoff(now, usage_timestamps):
+def _session_cutoff(now, usage_timestamps, anchor, scan_floor):
     """Return (cutoff, is_anchored) for the 5h session containing `now`.
 
     cutoff is the session START — scan_window counts from here, not from
@@ -625,11 +632,15 @@ def _session_cutoff(now, usage_timestamps):
     5h sessions do not tile on a fixed grid: a session ends 5h after it
     starts, and the *next* one begins on the first request after that —
     so we roll forward by activity gaps, never by adding 5h blindly.
+
+    `anchor` is (window_start, window_end) or None. `scan_floor` is how far
+    back scan_window actually scanned: the roll-forward tiles sessions from
+    the anchor's window_end and needs activity history all the way back to
+    it, so if the scan did not reach window_end (anchor older than the
+    lookback cap) the tiling could mis-read a mid-session request clipped
+    at the scan boundary as a session start — fall back to rolling-5h then.
     """
     rolling = now - WINDOW_SECS
-    if not SESSION_ANCHOR_ENABLED:
-        return rolling, False
-    anchor = get_session_anchor()
     if anchor is None:
         return rolling, False
     ws, we = anchor
@@ -638,6 +649,8 @@ def _session_cutoff(now, usage_timestamps):
     if now < ws:
         return rolling, False            # anchor in the future → clock skew, bail
     # Anchored session expired; roll forward to the session holding `now`.
+    if scan_floor > we:
+        return rolling, False            # roll-forward history incomplete
     seg_end = we
     for _ in range(8):                   # bounded catch-up (8 x 5h)
         nxt = next((t for t in usage_timestamps if t > seg_end), None)
@@ -676,10 +689,21 @@ def scan_window(now=None):
     rolling_cutoff = now - WINDOW_SECS
     weights = get_weights()
 
+    # When an expired anchor exists, _session_cutoff's roll-forward needs
+    # usage history back to the anchor's window_end to tile sessions
+    # correctly — otherwise a mid-session request clipped at now-5h looks
+    # like a session start. Extend the scan-back to window_end, capped at
+    # _ANCHOR_ROLLFORWARD_LOOKBACK.
+    anchor = get_session_anchor() if SESSION_ANCHOR_ENABLED else None
+    scan_floor = rolling_cutoff
+    if anchor is not None and anchor[1] < now:
+        scan_floor = min(rolling_cutoff,
+                         max(anchor[1], now - _ANCHOR_ROLLFORWARD_LOOKBACK))
+
     raw = []  # (ts, w_inc, rl, msg_key)
     for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         try:
-            if os.path.getmtime(f) < rolling_cutoff:
+            if os.path.getmtime(f) < scan_floor:
                 continue
         except OSError:
             continue
@@ -691,7 +715,7 @@ def scan_window(now=None):
                     except json.JSONDecodeError:
                         continue
                     ts = parse_ts(d.get("timestamp"))
-                    if ts < rolling_cutoff:
+                    if ts < scan_floor:
                         continue
                     msg = d.get("message") or {}
                     u = msg.get("usage") or {}
@@ -706,7 +730,7 @@ def scan_window(now=None):
 
     # Anchor the cutoff to the real session start instead of now-5h.
     usage_ts = [ts for ts, w_inc, _, _ in raw if w_inc]
-    cutoff, anchored = _session_cutoff(now, usage_ts)
+    cutoff, anchored = _session_cutoff(now, usage_ts, anchor, scan_floor)
 
     # One API response carries one requestId, but Claude Code writes a
     # separate jsonl line per content block (thinking, text, each

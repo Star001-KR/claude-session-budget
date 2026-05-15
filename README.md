@@ -273,25 +273,25 @@ from session_budget_manager import SessionBudgetManager
 budget = SessionBudgetManager()
 
 async def dispatch_task(task):
-    wait_secs = await budget.check_before_dispatch()
+    # check_and_status() runs one JSONL scan for both the pause decision
+    # and the status text (check_before_dispatch() + get_status() = two).
+    wait_secs, status = await budget.check_and_status()
     if wait_secs:
         await asyncio.sleep(wait_secs)
-    # Optional: log current state for dashboards / observability
-    s = budget.get_status()
-    log.info(f"{s['pct']}% — resets in {s['remaining_str']} (epoch={s['reset_at']})")
+    log.info(f"{status['pct']}% — resets in {status['remaining_str']}")
 ```
 
-`get_status()` returns a dict with both raw numbers and a human-friendly
-remaining string:
+`get_status()` — and the dict returned by `check_and_status()` — gives raw
+numbers plus a human-friendly remaining string:
 
 ```python
 {
   "pct": 13.2,
   "weighted_tokens": 2_128_235,
   "calibrated_limit": 30_000_000,
-  "reset_at": 1778355198.018,        # epoch seconds (anchor + 5h, or oldest msg + 5h)
-  "remaining_secs": 16_755,
-  "remaining_str": "4h 39m",         # or "already reset" when remaining == 0
+  "reset_at": 1778355198.018,        # epoch secs; None at 0 usage with no active session
+  "remaining_secs": 16_755,          # None when reset_at is None
+  "remaining_str": "4h 39m",         # "already reset", or "n/a" when there is no session
 }
 ```
 
@@ -445,7 +445,7 @@ If `install.sh` ever fails mid-run, it backs up your previous
 | `scripts/session_budget_manager.py` | Full async class for PM/orchestrator integration |
 | `scripts/calibrate.py` | Manual calibration entry from a `/usage` reading |
 | `scripts/_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
-| `tests/test_budget_core.py` | Unit tests (117) — env loading, jsonl scan, content-block dedup, session-window anchoring, signature matcher, EWMA, TTL-aware weighting, auto-calibration trigger, /usage parser |
+| `tests/test_budget_core.py` | Unit tests (119) — env loading, jsonl scan, content-block dedup, session-window anchoring, signature matcher, EWMA, TTL-aware weighting, auto-calibration trigger, /usage parser |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |

@@ -1508,6 +1508,38 @@ class SessionCutoffTests(unittest.TestCase):
             self.assertEqual(total, 0)
 
 
+    def test_rollforward_does_not_resurrect_expired_session(self):
+        """P1 regression: a session whose first request is older than 5h
+        (clipped by the rolling scan) must not be resurrected — its
+        in-window tail belongs to an already-expired session, so usage
+        reads 0 (gap), not the tail."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we = now - 6 * 3600                  # expired anchor, 6h-old window_end
+            ws = we - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 5.5 * 3600, input_=1, request_id="first"),
+                usage_entry(now - 4 * 3600, input_=999, request_id="tail"),
+            ], cal_data={"session_window": {"window_start": ws, "window_end": we,
+                                            "anchored_at": ws}})
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 0)           # session [-5.5h,-0.5h] expired → gap
+
+    def test_anchor_beyond_lookback_falls_back_to_rolling(self):
+        """An anchor whose window_end is older than the roll-forward
+        lookback cap can't be tiled reliably → rolling-5h fallback."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we = now - 12 * 3600                 # 12h-old window_end → beyond ~10h cap
+            ws = we - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 2 * 3600, input_=500, request_id="a"),
+            ], cal_data={"session_window": {"window_start": ws, "window_end": we,
+                                            "anchored_at": ws}})
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 500)         # rolling-5h fallback counts in-window
+
+
 class ShouldAnchorSessionTests(unittest.TestCase):
     """should_anchor_session / note_anchor_dispatch / clear_anchor_retries:
     fire auto_calibrate to (re-)capture a /usage anchor when the current
