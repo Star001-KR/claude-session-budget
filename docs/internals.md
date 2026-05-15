@@ -89,6 +89,10 @@ The fix anchors the cutoff to the real boundary:
 - When the anchored window has expired, it **rolls forward** by activity
   gaps — the next session starts at the first usage timestamp after the
   previous `window_end` — since 5h sessions don't tile on a fixed grid.
+  `scan_window` extends its scan-back to the anchor's `window_end` so the
+  roll-forward sees complete history; an anchor whose `window_end` is older
+  than the lookback cap (~10h) is too stale to tile from → rolling-5h
+  fallback.
 - No anchor on file (or `BUDGET_SESSION_ANCHOR=0`) → rolling-5h fallback.
 
 **Capturing the anchor.** The hook fires `auto_calibrate.py` when the
@@ -288,8 +292,10 @@ running `budget_check.py` 100 times against the same event learns it once.
 
 ## Testing
 
-The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
-(117 tests). Each layer has its own test class:
+The suite lives in [`tests/`](../tests) — 125 tests: `test_budget_core.py`
+(119, the classes below) and `test_session_budget_manager.py` (6 —
+`check_and_status()` single-scan, `get_status()` zero-usage reset handling).
+Each `test_budget_core.py` class:
 
 - `LoadEnvFileTests` — env loader semantics (incl. opt-in cwd `.env`)
 - `ParseTsTests` — timestamp parsing edge cases
