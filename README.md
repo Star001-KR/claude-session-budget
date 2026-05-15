@@ -421,7 +421,6 @@ If `install.sh` ever fails mid-run, it backs up your previous
 ## Limitations
 
 - Token weights are a **proxy** — Anthropic's internal formula is not public
-- **Peak hours** (weekday 5–11am PT) consume limits faster
 - **Cross-device usage** is not tracked (JSONL files are local only)
 - **No exact server-side anchor**: we use a plain rolling-5h cutoff (see
   [Why no `bridge_status` anchor?](#why-no-bridge_status-anchor)). The
