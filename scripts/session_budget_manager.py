@@ -14,8 +14,9 @@ import asyncio, logging, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _budget_core import (
-    scan_window, maybe_update_calibration, get_calibrated_limit,
-    get_session_anchor, THRESHOLD_SYNC, THRESHOLD_PAUSE, WINDOW_SECS,
+    scan_window, maybe_update_calibration, maybe_kick_auto_calibrate,
+    get_calibrated_limit, get_session_anchor,
+    THRESHOLD_SYNC, THRESHOLD_PAUSE, WINDOW_SECS,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,13 +33,28 @@ class SessionBudgetManager:
         return get_calibrated_limit()
 
     def _snapshot(self):
-        """Single JSONL scan; refresh calibration off the same result."""
+        """One JSONL scan, shared by every public method. Off that single
+        scan it also refreshes EWMA calibration and — for a headless
+        caller with no PreToolUse hook — kicks background auto-calibration.
+
+        #2 (orchestrator auto-calibration): the PreToolUse hook is what
+        spawns auto_calibrate.py in a hook-driven install; an orchestrator
+        that drives SessionBudgetManager directly never runs that hook, so
+        without this it would never self-calibrate against real /usage.
+        Both refreshes are gated on `self._explicit_limit is None` — an
+        explicit limit means the caller owns calibration, so stored state
+        is left untouched.
+        """
         scan = scan_window()
         if self._explicit_limit is None:
             maybe_update_calibration(scan_result=scan)
         weighted, oldest, _ = scan
         limit = self.calibrated_limit
         pct = min(weighted / limit, 1.0) if limit else 0.0
+        if self._explicit_limit is None:
+            reason = maybe_kick_auto_calibrate(pct, oldest)
+            if reason:
+                logger.info(f"[Budget] auto-calibration triggered ({reason}, background)")
         return pct, weighted, oldest, limit
 
     def _status_dict(self, snap):
