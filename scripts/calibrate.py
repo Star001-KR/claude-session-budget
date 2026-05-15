@@ -132,7 +132,7 @@ def main():
     print(f"\nSaved to {CALIBRATION_FILE}")
     print("Auto-loaded on next run; no env var needed.")
     print("\nKnown baselines:")
-    print("  Claude Max (5x): ~63,226,913  (measured 2026-05-09)")
+    print("  Claude Max (5x): ~30,000,000  (measured 2026-05-15, post-dedup)")
     print("  Claude Pro:      unknown — please contribute!")
 
 

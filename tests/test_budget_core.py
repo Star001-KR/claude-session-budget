@@ -7,7 +7,9 @@ Strategy:
   in a TemporaryDirectory, then importlib.reload(_budget_core) so the module-level
   constants pick the new values up.
 - Synthesise minimal JSONL fixtures that mirror Claude Code's session log shape:
-  one assistant message per line, each with `timestamp` and `message.usage`.
+  assistant entries with `timestamp` and `message.usage`. Claude Code emits
+  one jsonl line per content block of a turn, all sharing one `requestId`;
+  pass `request_id=` to usage_entry() to model that and exercise dedup.
 """
 import importlib
 import json
@@ -63,13 +65,20 @@ def write_jsonl(path, entries):
 
 
 def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0,
-                cache_create_5m=None, cache_create_1h=None):
+                cache_create_5m=None, cache_create_1h=None,
+                request_id=None, message_id=None):
     """Build a synthetic usage entry.
 
     `cache_create` is the legacy flat field; `cache_create_5m` and
     `cache_create_1h` populate the per-TTL breakdown that newer Claude
     Code builds emit. Pass either form (or both, in which case the
     legacy total should equal the breakdown sum, mirroring real jsonl).
+
+    `request_id` / `message_id` populate the top-level `requestId` and
+    `message.id`. Real Claude Code emits one jsonl line per content
+    block of an assistant turn, all repeating the same usage and sharing
+    one requestId — give several entries the same `request_id` to model
+    that and exercise scan_window's de-duplication.
     """
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -84,10 +93,13 @@ def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0,
             "ephemeral_5m_input_tokens": cache_create_5m or 0,
             "ephemeral_1h_input_tokens": cache_create_1h or 0,
         }
-    return {
-        "timestamp": ts,
-        "message": {"usage": usage},
-    }
+    message = {"usage": usage}
+    if message_id is not None:
+        message["id"] = message_id
+    entry = {"timestamp": ts, "message": message}
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
 
 
 def bridge_status_entry(ts, content="/remote-control is active"):
@@ -426,6 +438,84 @@ class ScanWindowTests(unittest.TestCase):
             self.assertEqual(total, 0)
 
 
+class ScanWindowDedupTests(unittest.TestCase):
+    """scan_window charges each API request once.
+
+    Claude Code writes one jsonl line per content block of an assistant
+    turn (thinking, text, each tool_use) and repeats the identical
+    message.usage on every line — all sharing one requestId. Summing per
+    line multiplies a tool-heavy turn by its block count; scan_window
+    must de-duplicate on requestId (message.id as fallback).
+    """
+
+    def setUp(self):
+        self.now = time.time()
+
+    def _scan_total(self, tmp, entries):
+        projects = os.path.join(tmp, "projects")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
+        core = reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+        })
+        return core.scan_window(now=self.now)[0]
+
+    def test_content_block_split_counted_once(self):
+        """12 lines, one requestId, identical usage — counted once, not 12x."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 60, input_=1000, output=200,
+                            request_id="req_A", message_id="msg_A")
+                for _ in range(12)
+            ]
+            # one request: 1000*1 + 200*5 = 2000  (NOT 12 * 2000)
+            self.assertEqual(self._scan_total(tmp, entries), 2000)
+
+    def test_distinct_requests_both_counted(self):
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 90, input_=1000, request_id="req_A"),
+                usage_entry(self.now - 80, input_=1000, request_id="req_A"),  # same turn
+                usage_entry(self.now - 60, input_=500, request_id="req_B"),
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 1500)
+
+    def test_message_id_fallback_when_no_request_id(self):
+        """No requestId present → dedup falls back to message.id."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 60, input_=777, message_id="msg_X")
+                for _ in range(4)
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 777)
+
+    def test_keyless_entries_each_counted(self):
+        """Entries with neither requestId nor message.id can't be deduped —
+        each counts, preserving behaviour for that (older / synthetic) shape."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 90, input_=100),
+                usage_entry(self.now - 60, input_=100),
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 200)
+
+    def test_dedup_spans_multiple_files(self):
+        """A requestId appearing in more than one file is still one request."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "projects")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "a", "s.jsonl"),
+                        [usage_entry(self.now - 60, input_=1000, request_id="req_A")])
+            write_jsonl(os.path.join(projects, "b", "s.jsonl"),
+                        [usage_entry(self.now - 50, input_=1000, request_id="req_A")])
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+            })
+            self.assertEqual(core.scan_window(now=self.now)[0], 1000)
+
+
 class CalibrationTests(unittest.TestCase):
     def test_load_save_roundtrip(self):
         with TemporaryDirectory() as tmp:
@@ -442,7 +532,7 @@ class CalibrationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             cf = os.path.join(tmp, "c.json")
             with open(cf, "w") as f:
-                json.dump({"limit": 50_000_000}, f)
+                json.dump({"limit": 50_000_000, "counts_deduped": True}, f)
 
             core = reload_core({
                 "BUDGET_PROJECTS_DIR": tmp,
@@ -548,7 +638,7 @@ class RecordObservedPctTests(unittest.TestCase):
             ])
             cf = os.path.join(tmp, "c.json")
             with open(cf, "w") as f:
-                json.dump({"limit": 10_000}, f)
+                json.dump({"limit": 10_000, "counts_deduped": True}, f)
             core = reload_core({
                 "BUDGET_PROJECTS_DIR": projects,
                 "BUDGET_CALIBRATION_FILE": cf,
@@ -570,6 +660,77 @@ class RecordObservedPctTests(unittest.TestCase):
             })
             self.assertIsNone(core.record_observed_pct(50))           # no usage
             self.assertIsNone(core.record_observed_pct(0, weighted=1))
+
+
+class CalibrationMigrationTests(unittest.TestCase):
+    """Auto-migration off pre-dedup calibration.
+
+    A calibration file written before the content-block dedup fix holds
+    a `limit` derived from ~3.3x-inflated weighted totals and lacks the
+    `counts_deduped` marker. get_calibrated_limit must ignore that stale
+    limit (fall back to DEFAULT_LIMIT) so the install base migrates on
+    upgrade instead of flipping to under-prediction.
+    """
+
+    def test_pre_dedup_limit_is_ignored(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 64_000_000}, f)  # no counts_deduped marker
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            self.assertEqual(core.get_calibrated_limit(), core.DEFAULT_LIMIT)
+
+    def test_post_dedup_limit_is_trusted(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 28_000_000, "counts_deduped": True}, f)
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            self.assertEqual(core.get_calibrated_limit(), 28_000_000)
+
+    def test_record_observed_pct_stamps_marker(self):
+        """A fresh calibration writes counts_deduped=True so it is trusted
+        from then on."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "p")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "x", "s.jsonl"), [
+                usage_entry(time.time() - 60, input_=1000, request_id="req_A"),
+            ])
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            core.record_observed_pct(50)
+            self.assertTrue(core.load_calibration().get("counts_deduped"))
+
+    def test_stale_prior_not_blended_into_new_calibration(self):
+        """record_observed_pct must not EWMA-merge against a pre-dedup
+        (inflated) prior limit — it seeds fresh from the observation."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "p")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "x", "s.jsonl"), [
+                usage_entry(time.time() - 60, input_=2000, request_id="req_A"),
+            ])
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 10_000}, f)  # pre-dedup: no marker
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": cf,
+                "BUDGET_EWMA_ALPHA": "0.5",
+            })
+            # observed 50% → observed_limit 4000. Stale prior 10000 is
+            # ignored → fresh seed 4000, not the EWMA blend (7000).
+            self.assertEqual(core.record_observed_pct(50), 4000)
 
 
 class MaybeUpdateCalibrationTests(unittest.TestCase):
@@ -605,6 +766,7 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
             with open(cf) as fh:
                 cal = json.load(fh)
             self.assertEqual(cal["limit"], expected)
+            self.assertTrue(cal["counts_deduped"])
             self.assertEqual(len(cal["history"]), 1)
             self.assertEqual(cal["history"][0]["kind"], "rate_limit_detected")
 

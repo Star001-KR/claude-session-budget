@@ -113,7 +113,7 @@ pbpaste | python3 scripts/calibrate.py --from-stdin
 ```
 
 Known baselines (used until auto-learning kicks in):
-- **Claude Max (5x):** ~63,226,913 weighted tokens = 100% (measured 2026-05-09)
+- **Claude Max (5x):** ~30,000,000 weighted tokens = 100% (measured 2026-05-15, post-dedup)
 - **Claude Pro:** unknown — contributions welcome
 
 ### Background auto-calibration (zero user input)

@@ -16,7 +16,7 @@ files and the hook's exit code:
         ▼
   ┌────────────────────────────┐
   │ 1. Window scanner          │  cutoff = now − 5h
-  │    scan_window()            │  weighted = Σ compute_weighted(usage)
+  │    scan_window()            │  weighted = Σ usage, deduped per requestId
   └────────────────────────────┘
         │
         ▼
@@ -46,6 +46,27 @@ baseline, malformed lines are skipped, etc.
 `PROJECTS_DIR`, filters by file mtime first (cheap), then per-line
 `timestamp >= now − 5h`. There is **no anchor logic** — the cutoff is the
 plain rolling-5h boundary.
+
+### Per-request de-duplication
+
+Claude Code does **not** write one jsonl line per assistant turn — it
+writes one line per *content block* (the `thinking` block, the `text`
+block, and each `tool_use`), and every one of those lines repeats the
+**identical** `message.usage` for the turn. A 10-tool turn is 12 lines,
+all carrying the same usage.
+
+Summing `usage` over raw lines therefore multiplies a tool-heavy turn by
+its block count. On the orchestrator window that triggered this fix the
+inflation was **3.3×** (937 in-window lines → 301 unique requests;
+59.7M → 18.2M weighted). The error is workload-dependent — agentic /
+orchestrator sessions inflate far more than a plain chat — so no single
+calibrated `limit` scalar can compensate for it.
+
+`scan_window()` keys each line on `requestId` (falling back to
+`message.id`) and counts the weighted usage **once per request** — which
+is how Anthropic's 5h budget charges it: one API response, one deduction.
+Lines with neither key (older log formats, synthetic fixtures) cannot be
+deduped and are each counted.
 
 ### Why no `bridge_status` anchor
 
@@ -213,7 +234,7 @@ yet.
 | Path | Purpose |
 |---|---|
 | `~/.claude/projects/**/*.jsonl` | Read-only source — Claude Code's own session logs |
-| `~/.claude/.budget_calibration.json` | Our state: `limit`, `seen_events`, `history`, `weights` |
+| `~/.claude/.budget_calibration.json` | Our state: `limit`, `counts_deduped`, `seen_events`, `history`, `weights` |
 | `./.env`, `~/.claude/.env` | User-overridable config |
 
 `seen_events` is keyed by `f"{ts:.0f}"` to make calibration *idempotent* —
@@ -226,14 +247,15 @@ running `budget_check.py` 100 times against the same event learns it once.
 | jsonl line is malformed | skipped silently |
 | jsonl file mtime > 5h old | skipped (mtime optimization) |
 | No `bridge_status` in window | fallback to plain 5h rolling |
-| No api_error events ever | `limit` stays at `DEFAULT_LIMIT` (63M) |
+| No api_error events ever | `limit` stays at `DEFAULT_LIMIT` (30M) |
+| Pre-dedup calibration file (no `counts_deduped`) | stale `limit` ignored → `DEFAULT_LIMIT` until re-calibrated |
 | `~/.claude/.budget_calibration.json` corrupt | treated as empty, recreated on next save |
 | `~/.claude/projects` missing | `weighted = 0`, `pct = 0%` (proceed) |
 
 ## Testing
 
 The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
-(86 tests). Each layer has its own test class:
+(95 tests). Each layer has its own test class:
 
 - `LoadEnvFileTests` — env loader semantics (incl. opt-in cwd `.env`)
 - `ParseTsTests` — timestamp parsing edge cases
@@ -241,11 +263,15 @@ The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
   false-positive regression cases
 - `ScanWindowTests` — Layer 1 rolling-5h scan, mtime fast-path, malformed
   line tolerance, body-text false-positive guard
+- `ScanWindowDedupTests` — Layer 1 per-requestId de-duplication of
+  content-block-split usage lines
 - `ScanWindowAnchorTests` — Layer 1 `oldest` semantics under mixed inputs
 - `ComputeWeightedTests` — TTL-aware cache_creation accounting (5m vs 1h,
   legacy field supersession)
 - `CalibrationTests` / `RecordObservedPctTests` / `MaybeUpdateCalibrationTests`
   — Layer 4 EWMA + atomic save round-trips
+- `CalibrationMigrationTests` — auto-migration off pre-dedup calibration
+  files via the `counts_deduped` marker
 - `ThresholdConstantsTests` — env-var binding incl. sleep-mode constants
 - `AutoCalibrateTriggerTests` — milestone gating, cooldown, window-key
   rollover for `should_fire_auto_calibrate()`

@@ -98,7 +98,12 @@ DEFAULT_WEIGHTS = {
     "cache_creation_1h_input_tokens": 2.0,      # ephemeral_1h_input_tokens
     "cache_read_input_tokens": 0.10,
 }
-DEFAULT_LIMIT = 63_226_913
+# Post-dedup Claude Max (5x) baseline: weighted tokens for one full 5h
+# window at 100%. Re-derived 2026-05-15 from the Slack-incident window
+# after the scan_window content-block dedup fix — the pre-dedup figure
+# (~63.2M) was inflated ~3.3x by counting one API response once per
+# content-block jsonl line. Seed only; calibration refines it per /usage.
+DEFAULT_LIMIT = 30_000_000
 
 
 def _env_float(name, default, minimum=None, maximum=None):
@@ -208,6 +213,23 @@ def save_calibration(data):
         _log_swallowed(e, "save_calibration")
 
 
+def _stored_limit(cal):
+    """Return the calibrated limit from `cal`, but only if it is post-dedup.
+
+    Calibration files written before the scan_window content-block dedup
+    fix hold a `limit` derived from ~3.3x-inflated weighted totals. They
+    lack the `counts_deduped` marker; we ignore their `limit` so the
+    install base auto-migrates to DEFAULT_LIMIT on upgrade instead of
+    silently flipping to under-prediction. Returns None when there is no
+    trustworthy stored limit.
+    """
+    if (cal.get("counts_deduped")
+            and isinstance(cal.get("limit"), (int, float))
+            and cal["limit"] > 0):
+        return int(cal["limit"])
+    return None
+
+
 def get_calibrated_limit():
     """Priority: BUDGET_CALIBRATED_LIMIT env > stored calibration > default."""
     env_limit = os.environ.get("BUDGET_CALIBRATED_LIMIT")
@@ -216,10 +238,8 @@ def get_calibrated_limit():
             return int(env_limit)
         except ValueError:
             pass
-    cal = load_calibration()
-    if isinstance(cal.get("limit"), (int, float)) and cal["limit"] > 0:
-        return int(cal["limit"])
-    return DEFAULT_LIMIT
+    stored = _stored_limit(load_calibration())
+    return stored if stored is not None else DEFAULT_LIMIT
 
 
 def auto_calibrate_supported():
@@ -438,7 +458,9 @@ def scan_window(now=None):
     anchoring and only use rolling-5h + earliest in-window usage.
 
     Returns:
-        weighted_total (int): sum of weighted usage tokens since cutoff.
+        weighted_total (int): sum of weighted usage tokens since cutoff,
+            de-duplicated per requestId — Claude Code logs one jsonl line
+            per content block, each repeating the same message.usage.
         oldest_usage_ts (float): earliest in-window usage message ts.
             Reset time = oldest_usage_ts + WINDOW_SECS. Falls back to
             `now` when there is no in-window usage activity.
@@ -449,7 +471,7 @@ def scan_window(now=None):
     cutoff = now - WINDOW_SECS
     weights = get_weights()
 
-    raw = []  # (ts, w_inc, rl)
+    raw = []  # (ts, w_inc, rl, msg_key)
     for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         try:
             if os.path.getmtime(f) < cutoff:
@@ -466,21 +488,32 @@ def scan_window(now=None):
                     ts = parse_ts(d.get("timestamp"))
                     if ts < cutoff:
                         continue
-                    u = (d.get("message") or {}).get("usage") or {}
+                    msg = d.get("message") or {}
+                    u = msg.get("usage") or {}
                     w_inc = compute_weighted(u, weights) if u else 0
                     rl = _looks_like_rate_limit(d)
                     if w_inc or rl:
-                        raw.append((ts, w_inc, rl))
+                        raw.append((ts, w_inc, rl, d.get("requestId") or msg.get("id")))
         except OSError:
             continue
 
     raw.sort(key=lambda e: e[0])
 
+    # One API response carries one requestId, but Claude Code writes a
+    # separate jsonl line for every content block of the assistant turn
+    # (thinking, text, each tool_use) and repeats the *identical*
+    # message.usage on each. Summing per line multiplies a tool-heavy
+    # turn by its block count (observed: up to 12x). De-duplicate on
+    # requestId (message.id as fallback) so each request is charged once;
+    # keyless entries can't be deduped and are each counted.
     total = 0
     oldest = now
     events = []
-    for ts, w_inc, rl in raw:
-        if w_inc:
+    counted = set()
+    for ts, w_inc, rl, msg_key in raw:
+        if w_inc and (msg_key is None or msg_key not in counted):
+            if msg_key is not None:
+                counted.add(msg_key)
             total += w_inc
             if cutoff < ts < oldest:
                 oldest = ts
@@ -507,7 +540,7 @@ def maybe_update_calibration(scan_result=None):
         if key in seen or weighted_at_event <= 0:
             continue
         seen.add(key)
-        prior = float(cal.get("limit") or DEFAULT_LIMIT)
+        prior = float(_stored_limit(cal) or DEFAULT_LIMIT)
         new_limit = int(EWMA_ALPHA * weighted_at_event + (1 - EWMA_ALPHA) * prior)
         cal["limit"] = new_limit
         cal.setdefault("history", []).append({
@@ -520,6 +553,7 @@ def maybe_update_calibration(scan_result=None):
         changed = True
 
     if changed:
+        cal["counts_deduped"] = True
         cal["seen_events"] = sorted(seen)
         save_calibration(cal)
 
@@ -534,12 +568,13 @@ def record_observed_pct(observed_pct, weighted=None):
         return None
     observed_limit = int(weighted / (observed_pct / 100))
     cal = load_calibration()
-    if isinstance(cal.get("limit"), (int, float)) and cal["limit"] > 0:
-        prior = float(cal["limit"])
+    prior = _stored_limit(cal)
+    if prior:
         new_limit = int(EWMA_ALPHA * observed_limit + (1 - EWMA_ALPHA) * prior)
     else:
         new_limit = observed_limit
     cal["limit"] = new_limit
+    cal["counts_deduped"] = True
     cal.setdefault("history", []).append({
         "ts": time.time(),
         "kind": "manual",
