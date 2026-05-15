@@ -258,7 +258,12 @@ Or manually add to `~/.claude/settings.json`:
 mkdir -p .claude/skills/session-budget
 cp skills/budget-check/SKILL.md .claude/skills/session-budget/SKILL.md
 cp scripts/budget_check.py .claude/skills/session-budget/check.py
+cp scripts/_budget_core.py .claude/skills/session-budget/_budget_core.py
 ```
+
+`check.py` imports `_budget_core.py` from its own directory, so both files
+must be copied together. Auto-calibration is skipped in this mode unless you
+also copy `auto_calibrate.py` alongside them.
 
 ### Option F — PM Layer / Orchestrator (manual)
 
