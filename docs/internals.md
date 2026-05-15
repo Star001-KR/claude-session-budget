@@ -15,8 +15,8 @@ files and the hook's exit code:
         │
         ▼
   ┌────────────────────────────┐
-  │ 1. Window scanner          │  cutoff = now − 5h
-  │    scan_window()            │  weighted = Σ compute_weighted(usage)
+  │ 1. Window scanner          │  cutoff = /usage-anchored
+  │    scan_window()            │  session start; Σ usage per requestId
   └────────────────────────────┘
         │
         ▼
@@ -43,9 +43,61 @@ baseline, malformed lines are skipped, etc.
 ## Layer 1 — Window scan
 
 [`scan_window()`](../scripts/_budget_core.py) walks every jsonl in
-`PROJECTS_DIR`, filters by file mtime first (cheap), then per-line
-`timestamp >= now − 5h`. There is **no anchor logic** — the cutoff is the
-plain rolling-5h boundary.
+`PROJECTS_DIR`, filters by file mtime first (cheap), then sums weighted
+usage from the **current 5h session's start** — anchored to the real
+session boundary (see *Session-window anchoring* below), with a plain
+rolling-5h cutoff as the no-anchor fallback.
+
+### Per-request de-duplication
+
+Claude Code does **not** write one jsonl line per assistant turn — it
+writes one line per *content block* (the `thinking` block, the `text`
+block, and each `tool_use`), and every one of those lines repeats the
+**identical** `message.usage` for the turn. A 10-tool turn is 12 lines,
+all carrying the same usage.
+
+Summing `usage` over raw lines therefore multiplies a tool-heavy turn by
+its block count. On the orchestrator window that triggered this fix the
+inflation was **3.3×** (937 in-window lines → 301 unique requests;
+59.7M → 18.2M weighted). The error is workload-dependent — agentic /
+orchestrator sessions inflate far more than a plain chat — so no single
+calibrated `limit` scalar can compensate for it.
+
+`scan_window()` keys each line on `requestId` (falling back to
+`message.id`) and counts the weighted usage **once per request** — which
+is how Anthropic's 5h budget charges it: one API response, one deduction.
+Lines with neither key (older log formats, synthetic fixtures) cannot be
+deduped and are each counted.
+
+### Session-window anchoring
+
+A plain rolling `now − 5h` cutoff has a subtler flaw than de-duplication:
+it **straddles real session resets**. Anthropic's 5h limit is a discrete
+window — it resets at a point in time, and the *next* session starts on
+the first request after that. JSONL carries no reset marker, so a rolling
+window keeps summing the previous, already-expired session's tail for up
+to 5h after every reset (observed: 63% reported vs 6% real, right after a
+reset).
+
+The fix anchors the cutoff to the real boundary:
+
+- `auto_calibrate.py` already captures the `/usage` panel; its
+  `Resets HH:MM` clue is parsed by [`parse_reset_to_ts()`](../scripts/_budget_core.py)
+  into a `window_end` timestamp and stored as `session_window` in the
+  calibration file (`window_start = window_end − 5h`).
+- `scan_window()` then counts from `window_start`, not `now − 5h`.
+- When the anchored window has expired, it **rolls forward** by activity
+  gaps — the next session starts at the first usage timestamp after the
+  previous `window_end` — since 5h sessions don't tile on a fixed grid.
+- No anchor on file (or `BUDGET_SESSION_ANCHOR=0`) → rolling-5h fallback.
+
+**Capturing the anchor.** The hook fires `auto_calibrate.py` when the
+current session has no valid anchor (`should_anchor_session()`), gated by
+the auto-cal cooldown. A `/usage` read can lag — right after a reset it
+may still show the just-expired session. `session_window_is_valid()`
+rejects any `window_end` outside `(now, now+5h]`; a rejected read is not
+stored, and the hook re-dispatches after the cooldown (bounded by a
+consecutive-retry cap).
 
 ### Why no `bridge_status` anchor
 
@@ -60,19 +112,21 @@ to the remote-control bridge, which happens *every* time the user runs
 `max(bridge_status_ts)` as anchor caused the cutoff to leap forward each
 time a new CLI session started, silently zeroing the budget mid-window.
 
-The current implementation ignores `bridge_status` entirely. The trade-off:
-we cannot pinpoint the server's exact 5h-window start, so our `oldest`
-(earliest in-window usage ts) lags the true anchor by however much idle
-time preceded the first jsonl message — usually a few minutes. Activity
-on other devices or `claude.ai` web is invisible to local jsonl regardless
-of any anchor strategy, so this estimator is structurally a *lower bound*
-on the server-side `/usage` number anyway.
+`bridge_status` is still ignored for anchoring — the session boundary now
+comes from `/usage` instead (see *Session-window anchoring* above), the
+actual server-side reset time rather than a guess. Activity on other
+devices or `claude.ai` web remains invisible to local jsonl, so the
+weighted total is still a *lower bound* on the server-side number between
+`/usage` reads.
 
 ### `oldest` semantics
 
-Drives the reset-time estimate (`reset_at = oldest + 5h`):
-- ≥1 in-window usage entry → `oldest = earliest in-window usage ts`
-- Otherwise → `oldest = now` (effectively "fresh window")
+`scan_window()`'s second return value is the current session start;
+`reset_at = oldest + 5h`:
+- Anchored → `oldest = window_start`, so `reset_at` is the exact `/usage`
+  reset time.
+- Unanchored fallback → `oldest = earliest in-window usage ts` (or `now`
+  when the window holds no usage).
 
 ### Token weights — TTL-aware
 
@@ -213,7 +267,7 @@ yet.
 | Path | Purpose |
 |---|---|
 | `~/.claude/projects/**/*.jsonl` | Read-only source — Claude Code's own session logs |
-| `~/.claude/.budget_calibration.json` | Our state: `limit`, `seen_events`, `history`, `weights` |
+| `~/.claude/.budget_calibration.json` | Our state: `limit`, `counts_deduped`, `session_window`, `seen_events`, `history`, `weights` |
 | `./.env`, `~/.claude/.env` | User-overridable config |
 
 `seen_events` is keyed by `f"{ts:.0f}"` to make calibration *idempotent* —
@@ -225,15 +279,17 @@ running `budget_check.py` 100 times against the same event learns it once.
 |---|---|
 | jsonl line is malformed | skipped silently |
 | jsonl file mtime > 5h old | skipped (mtime optimization) |
-| No `bridge_status` in window | fallback to plain 5h rolling |
-| No api_error events ever | `limit` stays at `DEFAULT_LIMIT` (63M) |
+| No `/usage` session anchor on file | `scan_window` falls back to a plain rolling-5h cutoff |
+| `/usage` read lags (shows expired session) | `window_end` rejected, not stored; hook re-dispatches after cooldown |
+| No api_error events ever | `limit` stays at `DEFAULT_LIMIT` (30M) |
+| Pre-dedup calibration file (no `counts_deduped`) | stale `limit` ignored → `DEFAULT_LIMIT` until re-calibrated |
 | `~/.claude/.budget_calibration.json` corrupt | treated as empty, recreated on next save |
 | `~/.claude/projects` missing | `weighted = 0`, `pct = 0%` (proceed) |
 
 ## Testing
 
 The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
-(86 tests). Each layer has its own test class:
+(117 tests). Each layer has its own test class:
 
 - `LoadEnvFileTests` — env loader semantics (incl. opt-in cwd `.env`)
 - `ParseTsTests` — timestamp parsing edge cases
@@ -241,11 +297,18 @@ The full suite is in [`tests/test_budget_core.py`](../tests/test_budget_core.py)
   false-positive regression cases
 - `ScanWindowTests` — Layer 1 rolling-5h scan, mtime fast-path, malformed
   line tolerance, body-text false-positive guard
+- `ScanWindowDedupTests` — Layer 1 per-requestId de-duplication of
+  content-block-split usage lines
 - `ScanWindowAnchorTests` — Layer 1 `oldest` semantics under mixed inputs
+- `ParseResetToTsTests` / `SessionAnchorTests` / `SessionCutoffTests` /
+  `ShouldAnchorSessionTests` — Layer 1 session-window anchoring: `/usage`
+  reset parsing, anchor validity, the straddle-fixing cutoff, refresh trigger
 - `ComputeWeightedTests` — TTL-aware cache_creation accounting (5m vs 1h,
   legacy field supersession)
 - `CalibrationTests` / `RecordObservedPctTests` / `MaybeUpdateCalibrationTests`
   — Layer 4 EWMA + atomic save round-trips
+- `CalibrationMigrationTests` — auto-migration off pre-dedup calibration
+  files via the `counts_deduped` marker
 - `ThresholdConstantsTests` — env-var binding incl. sleep-mode constants
 - `AutoCalibrateTriggerTests` — milestone gating, cooldown, window-key
   rollover for `should_fire_auto_calibrate()`

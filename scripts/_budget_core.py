@@ -8,8 +8,8 @@ Responsibilities:
   - Persist auto-learned calibration to ~/.claude/.budget_calibration.json.
   - Detect rate-limit events in JSONL and EWMA-update the calibrated limit.
 """
-import glob, json, os, tempfile, time, traceback
-from datetime import datetime
+import glob, json, os, re, tempfile, time, traceback
+from datetime import datetime, timedelta
 
 WINDOW_SECS = 5 * 3600
 
@@ -98,7 +98,12 @@ DEFAULT_WEIGHTS = {
     "cache_creation_1h_input_tokens": 2.0,      # ephemeral_1h_input_tokens
     "cache_read_input_tokens": 0.10,
 }
-DEFAULT_LIMIT = 63_226_913
+# Post-dedup Claude Max (5x) baseline: weighted tokens for one full 5h
+# window at 100%. Re-derived 2026-05-15 from the Slack-incident window
+# after the scan_window content-block dedup fix — the pre-dedup figure
+# (~63.2M) was inflated ~3.3x by counting one API response once per
+# content-block jsonl line. Seed only; calibration refines it per /usage.
+DEFAULT_LIMIT = 30_000_000
 
 
 def _env_float(name, default, minimum=None, maximum=None):
@@ -168,6 +173,16 @@ AUTO_CAL_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes")
 HOOK_MAX_SLEEP_SECS = _env_int("BUDGET_MAX_SLEEP_SECS", "14400", minimum=0)
 
+# Session-window anchoring. When enabled, scan_window aligns its cutoff to
+# the real 5h session boundary — captured from /usage's "Resets" clue (see
+# parse_reset_to_ts / get_session_anchor) — instead of a plain now-5h
+# rolling window. A rolling window straddles real resets: right after a
+# reset it keeps summing the previous, already-expired session's tail. Set
+# BUDGET_SESSION_ANCHOR=0 to disable and fall back to rolling-5h.
+SESSION_ANCHOR_ENABLED = os.environ.get(
+    "BUDGET_SESSION_ANCHOR", "1"
+).strip().lower() in ("1", "true", "yes")
+
 
 def load_calibration():
     try:
@@ -208,6 +223,23 @@ def save_calibration(data):
         _log_swallowed(e, "save_calibration")
 
 
+def _stored_limit(cal):
+    """Return the calibrated limit from `cal`, but only if it is post-dedup.
+
+    Calibration files written before the scan_window content-block dedup
+    fix hold a `limit` derived from ~3.3x-inflated weighted totals. They
+    lack the `counts_deduped` marker; we ignore their `limit` so the
+    install base auto-migrates to DEFAULT_LIMIT on upgrade instead of
+    silently flipping to under-prediction. Returns None when there is no
+    trustworthy stored limit.
+    """
+    if (cal.get("counts_deduped")
+            and isinstance(cal.get("limit"), (int, float))
+            and cal["limit"] > 0):
+        return int(cal["limit"])
+    return None
+
+
 def get_calibrated_limit():
     """Priority: BUDGET_CALIBRATED_LIMIT env > stored calibration > default."""
     env_limit = os.environ.get("BUDGET_CALIBRATED_LIMIT")
@@ -216,10 +248,8 @@ def get_calibrated_limit():
             return int(env_limit)
         except ValueError:
             pass
-    cal = load_calibration()
-    if isinstance(cal.get("limit"), (int, float)) and cal["limit"] > 0:
-        return int(cal["limit"])
-    return DEFAULT_LIMIT
+    stored = _stored_limit(load_calibration())
+    return stored if stored is not None else DEFAULT_LIMIT
 
 
 def auto_calibrate_supported():
@@ -316,6 +346,71 @@ def mark_milestone_fired(milestone, oldest_ts, cal=None, now=None):
     return state
 
 
+_ANCHOR_MAX_RETRIES = 3  # consecutive /usage anchor attempts before backing off
+
+
+def should_anchor_session(cal=None, now=None):
+    """Whether auto_calibrate should run to (re-)capture a /usage session
+    anchor. True when the current session has no valid anchor — none on
+    file, or the stored one has expired (now past window_end). Gated by
+    the auto-cal cooldown and a small consecutive-retry cap so a broken
+    /usage capture can't spawn `claude` without bound.
+    """
+    if not (SESSION_ANCHOR_ENABLED and AUTO_CAL_ENABLED):
+        return False
+    if not auto_calibrate_supported():
+        return False
+    if os.environ.get("BUDGET_AUTO_CALIBRATE_RUNNING") == "1":
+        return False
+    if cal is None:
+        cal = load_calibration()
+    if now is None:
+        now = time.time()
+    anchor = get_session_anchor(cal)
+    if anchor is not None and anchor[0] <= now <= anchor[1]:
+        return False  # current session already anchored
+    state = cal.get("auto_cal_state") or {}
+    if now - (state.get("last_dispatch_ts") or 0) < AUTO_CAL_COOLDOWN_SECS:
+        return False  # a child was just dispatched — let it finish
+    retries = state.get("anchor_retries") or 0
+    if (retries >= _ANCHOR_MAX_RETRIES
+            and now - (state.get("anchor_retry_ts") or 0) < WINDOW_SECS):
+        return False  # capped — back off ~one session length before re-probing
+    return True
+
+
+def note_anchor_dispatch(cal=None, now=None):
+    """Hook-side: record that auto_calibrate was spawned for a session
+    anchor. Sets the cooldown anchor (last_dispatch_ts) and bumps the
+    consecutive-retry counter; a long gap since the last try resets it
+    (a fresh session deserves a fresh budget of retries)."""
+    if cal is None:
+        cal = load_calibration()
+    if now is None:
+        now = time.time()
+    state = cal.get("auto_cal_state") or {}
+    retries = state.get("anchor_retries") or 0
+    if now - (state.get("anchor_retry_ts") or 0) >= WINDOW_SECS:
+        retries = 0
+    state["anchor_retries"] = retries + 1
+    state["anchor_retry_ts"] = now
+    state["last_dispatch_ts"] = now
+    cal["auto_cal_state"] = state
+    save_calibration(cal)
+
+
+def clear_anchor_retries(cal=None):
+    """Reset the anchor retry counter — called once a session is
+    successfully anchored so the next session starts with a full budget."""
+    if cal is None:
+        cal = load_calibration()
+    state = cal.get("auto_cal_state") or {}
+    if state.get("anchor_retries"):
+        state["anchor_retries"] = 0
+        cal["auto_cal_state"] = state
+        save_calibration(cal)
+
+
 def get_weights():
     w = dict(DEFAULT_WEIGHTS)
     cal = load_calibration()
@@ -338,6 +433,54 @@ def parse_ts(v):
             _log_swallowed(e, f"parse_ts({v!r})")
             return 0.0
     return v / 1000 if v > 1e10 else float(v)
+
+
+# /usage "Resets" clue → timestamp. Matches "12am", "3:40am", "11:30pm".
+_RESET_TIME_RE = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.IGNORECASE)
+
+
+def parse_reset_to_ts(reset_clue, now=None):
+    """Convert a /usage 'Resets' clue (e.g. 'Resets 12am (Asia/Seoul)')
+    into the Unix timestamp of the next occurrence of that wall-clock time.
+
+    Resolved in the machine's LOCAL time. Claude Code's /usage panel shows
+    the reset in the account timezone; the budget tool runs on the same
+    machine, so local time == panel time in the normal case. If the
+    machine tz differs from the panel tz the result is off by the offset
+    — an accepted edge case for this dependency-free module; a wildly
+    wrong result is caught by session_window_is_valid()'s range check.
+
+    Returns a float timestamp, or None when the clue can't be parsed.
+    """
+    if not reset_clue:
+        return None
+    m = _RESET_TIME_RE.search(reset_clue)
+    if not m:
+        return None
+    try:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= hour <= 12) or not (0 <= minute <= 59):
+        return None
+    if m.group(3).lower() == "am":
+        hour = 0 if hour == 12 else hour
+    else:
+        hour = 12 if hour == 12 else hour + 12
+    if now is None:
+        now = time.time()
+    try:
+        target = datetime.fromtimestamp(now).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        ts = target.timestamp()
+        if ts <= now:
+            ts = (target + timedelta(days=1)).timestamp()
+        return ts
+    except Exception as e:
+        _log_swallowed(e, f"parse_reset_to_ts({reset_clue!r})")
+        return None
 
 
 def _looks_like_rate_limit(parsed):
@@ -425,34 +568,118 @@ def compute_weighted(usage, weights=None):
     return int(total)
 
 
-def scan_window(now=None):
-    """Scan in-window JSONL entries (single I/O pass).
+_ANCHOR_SKEW_SECS = 120  # clock-skew tolerance for the window-end range check
 
-    Uses a plain rolling 5h window. Earlier versions tried to anchor the
-    window on `type=system, subtype=bridge_status` entries, treating them
-    as "5h Max session start" markers — but those events fire whenever
-    `/remote-control` attaches to a new CLI session, which happens many
-    times inside one 5h window. Using them as an anchor causes the cutoff
-    to leap forward every time the user opens a new claude CLI, silently
-    resetting the budget count to ~0% mid-window. We now ignore them for
-    anchoring and only use rolling-5h + earliest in-window usage.
+
+def get_session_anchor(cal=None):
+    """Return (window_start, window_end) from the stored /usage anchor,
+    or None when no usable anchor is on file."""
+    if cal is None:
+        cal = load_calibration()
+    sw = cal.get("session_window")
+    if not isinstance(sw, dict):
+        return None
+    ws, we = sw.get("window_start"), sw.get("window_end")
+    if isinstance(ws, (int, float)) and isinstance(we, (int, float)) and 0 < ws < we:
+        return float(ws), float(we)
+    return None
+
+
+def session_window_is_valid(window_end, now=None):
+    """Whether a freshly-read /usage reset time is trustworthy as the
+    *current* session's end. Valid only in (now, now+5h] (± clock skew):
+    a lagging /usage still showing the just-expired session reports a
+    window_end <= now, which is rejected so the caller re-reads later."""
+    if not isinstance(window_end, (int, float)) or window_end <= 0:
+        return False
+    if now is None:
+        now = time.time()
+    return (now - _ANCHOR_SKEW_SECS) < window_end <= (now + WINDOW_SECS + _ANCHOR_SKEW_SECS)
+
+
+def save_session_anchor(window_end, now=None):
+    """Persist a /usage-derived session window (window_start = window_end
+    - 5h). No-op returning False when window_end fails the validity check."""
+    if now is None:
+        now = time.time()
+    if not session_window_is_valid(window_end, now):
+        return False
+    cal = load_calibration()
+    cal["session_window"] = {
+        "window_end": float(window_end),
+        "window_start": float(window_end) - WINDOW_SECS,
+        "anchored_at": now,
+    }
+    save_calibration(cal)
+    return True
+
+
+def _session_cutoff(now, usage_timestamps):
+    """Return (cutoff, is_anchored) for the 5h session containing `now`.
+
+    cutoff is the session START — scan_window counts from here, not from
+    now-5h. is_anchored is True when the cutoff came from a /usage anchor
+    (so reset = cutoff + 5h is trustworthy). `usage_timestamps` must be
+    ascending; it drives roll-forward across session boundaries.
+
+    5h sessions do not tile on a fixed grid: a session ends 5h after it
+    starts, and the *next* one begins on the first request after that —
+    so we roll forward by activity gaps, never by adding 5h blindly.
+    """
+    rolling = now - WINDOW_SECS
+    if not SESSION_ANCHOR_ENABLED:
+        return rolling, False
+    anchor = get_session_anchor()
+    if anchor is None:
+        return rolling, False
+    ws, we = anchor
+    if ws <= now <= we:
+        return ws, True                  # inside the anchored session
+    if now < ws:
+        return rolling, False            # anchor in the future → clock skew, bail
+    # Anchored session expired; roll forward to the session holding `now`.
+    seg_end = we
+    for _ in range(8):                   # bounded catch-up (8 x 5h)
+        nxt = next((t for t in usage_timestamps if t > seg_end), None)
+        if nxt is None:
+            return now, True             # gap — no active session, 0 usage
+        if now <= nxt + WINDOW_SECS:
+            return nxt, True             # session containing `now`
+        seg_end = nxt + WINDOW_SECS
+    return rolling, False                # gave up rolling forward → fallback
+
+
+def scan_window(now=None):
+    """Scan in-window JSONL entries and total weighted usage for the
+    current 5h session (single I/O pass).
+
+    The cutoff is anchored to the real session boundary when a /usage
+    "Resets" anchor is on file (see parse_reset_to_ts / get_session_anchor):
+    scan_window counts from the session START, not from a plain now-5h
+    rolling window. A rolling window straddles real session resets — right
+    after a reset it keeps summing the previous, already-expired session's
+    tail. With no anchor (or BUDGET_SESSION_ANCHOR=0) it falls back to
+    rolling-5h. `bridge_status` entries are never used for anchoring (they
+    fire on every /remote-control attach, not on a 5h reset).
 
     Returns:
-        weighted_total (int): sum of weighted usage tokens since cutoff.
-        oldest_usage_ts (float): earliest in-window usage message ts.
-            Reset time = oldest_usage_ts + WINDOW_SECS. Falls back to
-            `now` when there is no in-window usage activity.
+        weighted_total (int): weighted usage since the session cutoff,
+            de-duplicated per requestId — Claude Code logs one jsonl line
+            per content block, each repeating the same message.usage.
+        session_start (float): start of the current session. Reset time =
+            session_start + WINDOW_SECS (exact when anchored); falls back
+            to earliest in-window usage when unanchored.
         rate_limit_events (list[(ts, weighted_at_event)]).
     """
     if now is None:
         now = time.time()
-    cutoff = now - WINDOW_SECS
+    rolling_cutoff = now - WINDOW_SECS
     weights = get_weights()
 
-    raw = []  # (ts, w_inc, rl)
+    raw = []  # (ts, w_inc, rl, msg_key)
     for f in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         try:
-            if os.path.getmtime(f) < cutoff:
+            if os.path.getmtime(f) < rolling_cutoff:
                 continue
         except OSError:
             continue
@@ -464,25 +691,40 @@ def scan_window(now=None):
                     except json.JSONDecodeError:
                         continue
                     ts = parse_ts(d.get("timestamp"))
-                    if ts < cutoff:
+                    if ts < rolling_cutoff:
                         continue
-                    u = (d.get("message") or {}).get("usage") or {}
+                    msg = d.get("message") or {}
+                    u = msg.get("usage") or {}
                     w_inc = compute_weighted(u, weights) if u else 0
                     rl = _looks_like_rate_limit(d)
                     if w_inc or rl:
-                        raw.append((ts, w_inc, rl))
+                        raw.append((ts, w_inc, rl, d.get("requestId") or msg.get("id")))
         except OSError:
             continue
 
     raw.sort(key=lambda e: e[0])
 
+    # Anchor the cutoff to the real session start instead of now-5h.
+    usage_ts = [ts for ts, w_inc, _, _ in raw if w_inc]
+    cutoff, anchored = _session_cutoff(now, usage_ts)
+
+    # One API response carries one requestId, but Claude Code writes a
+    # separate jsonl line per content block (thinking, text, each
+    # tool_use), repeating the identical message.usage on each. Charge
+    # each request once, keyed on requestId (message.id fallback);
+    # keyless entries can't be deduped and are each counted.
     total = 0
-    oldest = now
+    oldest = cutoff if anchored else now
     events = []
-    for ts, w_inc, rl in raw:
-        if w_inc:
+    counted = set()
+    for ts, w_inc, rl, msg_key in raw:
+        if ts < cutoff:
+            continue
+        if w_inc and (msg_key is None or msg_key not in counted):
+            if msg_key is not None:
+                counted.add(msg_key)
             total += w_inc
-            if cutoff < ts < oldest:
+            if not anchored and ts < oldest:
                 oldest = ts
         if rl:
             events.append((ts, total))
@@ -507,7 +749,7 @@ def maybe_update_calibration(scan_result=None):
         if key in seen or weighted_at_event <= 0:
             continue
         seen.add(key)
-        prior = float(cal.get("limit") or DEFAULT_LIMIT)
+        prior = float(_stored_limit(cal) or DEFAULT_LIMIT)
         new_limit = int(EWMA_ALPHA * weighted_at_event + (1 - EWMA_ALPHA) * prior)
         cal["limit"] = new_limit
         cal.setdefault("history", []).append({
@@ -520,6 +762,7 @@ def maybe_update_calibration(scan_result=None):
         changed = True
 
     if changed:
+        cal["counts_deduped"] = True
         cal["seen_events"] = sorted(seen)
         save_calibration(cal)
 
@@ -534,12 +777,13 @@ def record_observed_pct(observed_pct, weighted=None):
         return None
     observed_limit = int(weighted / (observed_pct / 100))
     cal = load_calibration()
-    if isinstance(cal.get("limit"), (int, float)) and cal["limit"] > 0:
-        prior = float(cal["limit"])
+    prior = _stored_limit(cal)
+    if prior:
         new_limit = int(EWMA_ALPHA * observed_limit + (1 - EWMA_ALPHA) * prior)
     else:
         new_limit = observed_limit
     cal["limit"] = new_limit
+    cal["counts_deduped"] = True
     cal.setdefault("history", []).append({
         "ts": time.time(),
         "kind": "manual",

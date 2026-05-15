@@ -7,7 +7,9 @@ Strategy:
   in a TemporaryDirectory, then importlib.reload(_budget_core) so the module-level
   constants pick the new values up.
 - Synthesise minimal JSONL fixtures that mirror Claude Code's session log shape:
-  one assistant message per line, each with `timestamp` and `message.usage`.
+  assistant entries with `timestamp` and `message.usage`. Claude Code emits
+  one jsonl line per content block of a turn, all sharing one `requestId`;
+  pass `request_id=` to usage_entry() to model that and exercise dedup.
 """
 import importlib
 import json
@@ -41,6 +43,7 @@ def reload_core(env_overrides):
         "BUDGET_AUTO_CAL_MILESTONES",
         "BUDGET_AUTO_CAL_COOLDOWN_SECS",
         "BUDGET_AUTO_CALIBRATE_RUNNING",
+        "BUDGET_SESSION_ANCHOR",
     ]
     for k in keys:
         os.environ.pop(k, None)
@@ -63,13 +66,20 @@ def write_jsonl(path, entries):
 
 
 def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0,
-                cache_create_5m=None, cache_create_1h=None):
+                cache_create_5m=None, cache_create_1h=None,
+                request_id=None, message_id=None):
     """Build a synthetic usage entry.
 
     `cache_create` is the legacy flat field; `cache_create_5m` and
     `cache_create_1h` populate the per-TTL breakdown that newer Claude
     Code builds emit. Pass either form (or both, in which case the
     legacy total should equal the breakdown sum, mirroring real jsonl).
+
+    `request_id` / `message_id` populate the top-level `requestId` and
+    `message.id`. Real Claude Code emits one jsonl line per content
+    block of an assistant turn, all repeating the same usage and sharing
+    one requestId — give several entries the same `request_id` to model
+    that and exercise scan_window's de-duplication.
     """
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -84,10 +94,13 @@ def usage_entry(ts, *, input_=0, output=0, cache_create=0, cache_read=0,
             "ephemeral_5m_input_tokens": cache_create_5m or 0,
             "ephemeral_1h_input_tokens": cache_create_1h or 0,
         }
-    return {
-        "timestamp": ts,
-        "message": {"usage": usage},
-    }
+    message = {"usage": usage}
+    if message_id is not None:
+        message["id"] = message_id
+    entry = {"timestamp": ts, "message": message}
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
 
 
 def bridge_status_entry(ts, content="/remote-control is active"):
@@ -426,6 +439,84 @@ class ScanWindowTests(unittest.TestCase):
             self.assertEqual(total, 0)
 
 
+class ScanWindowDedupTests(unittest.TestCase):
+    """scan_window charges each API request once.
+
+    Claude Code writes one jsonl line per content block of an assistant
+    turn (thinking, text, each tool_use) and repeats the identical
+    message.usage on every line — all sharing one requestId. Summing per
+    line multiplies a tool-heavy turn by its block count; scan_window
+    must de-duplicate on requestId (message.id as fallback).
+    """
+
+    def setUp(self):
+        self.now = time.time()
+
+    def _scan_total(self, tmp, entries):
+        projects = os.path.join(tmp, "projects")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
+        core = reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+        })
+        return core.scan_window(now=self.now)[0]
+
+    def test_content_block_split_counted_once(self):
+        """12 lines, one requestId, identical usage — counted once, not 12x."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 60, input_=1000, output=200,
+                            request_id="req_A", message_id="msg_A")
+                for _ in range(12)
+            ]
+            # one request: 1000*1 + 200*5 = 2000  (NOT 12 * 2000)
+            self.assertEqual(self._scan_total(tmp, entries), 2000)
+
+    def test_distinct_requests_both_counted(self):
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 90, input_=1000, request_id="req_A"),
+                usage_entry(self.now - 80, input_=1000, request_id="req_A"),  # same turn
+                usage_entry(self.now - 60, input_=500, request_id="req_B"),
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 1500)
+
+    def test_message_id_fallback_when_no_request_id(self):
+        """No requestId present → dedup falls back to message.id."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 60, input_=777, message_id="msg_X")
+                for _ in range(4)
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 777)
+
+    def test_keyless_entries_each_counted(self):
+        """Entries with neither requestId nor message.id can't be deduped —
+        each counts, preserving behaviour for that (older / synthetic) shape."""
+        with TemporaryDirectory() as tmp:
+            entries = [
+                usage_entry(self.now - 90, input_=100),
+                usage_entry(self.now - 60, input_=100),
+            ]
+            self.assertEqual(self._scan_total(tmp, entries), 200)
+
+    def test_dedup_spans_multiple_files(self):
+        """A requestId appearing in more than one file is still one request."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "projects")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "a", "s.jsonl"),
+                        [usage_entry(self.now - 60, input_=1000, request_id="req_A")])
+            write_jsonl(os.path.join(projects, "b", "s.jsonl"),
+                        [usage_entry(self.now - 50, input_=1000, request_id="req_A")])
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+            })
+            self.assertEqual(core.scan_window(now=self.now)[0], 1000)
+
+
 class CalibrationTests(unittest.TestCase):
     def test_load_save_roundtrip(self):
         with TemporaryDirectory() as tmp:
@@ -442,7 +533,7 @@ class CalibrationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             cf = os.path.join(tmp, "c.json")
             with open(cf, "w") as f:
-                json.dump({"limit": 50_000_000}, f)
+                json.dump({"limit": 50_000_000, "counts_deduped": True}, f)
 
             core = reload_core({
                 "BUDGET_PROJECTS_DIR": tmp,
@@ -548,7 +639,7 @@ class RecordObservedPctTests(unittest.TestCase):
             ])
             cf = os.path.join(tmp, "c.json")
             with open(cf, "w") as f:
-                json.dump({"limit": 10_000}, f)
+                json.dump({"limit": 10_000, "counts_deduped": True}, f)
             core = reload_core({
                 "BUDGET_PROJECTS_DIR": projects,
                 "BUDGET_CALIBRATION_FILE": cf,
@@ -570,6 +661,77 @@ class RecordObservedPctTests(unittest.TestCase):
             })
             self.assertIsNone(core.record_observed_pct(50))           # no usage
             self.assertIsNone(core.record_observed_pct(0, weighted=1))
+
+
+class CalibrationMigrationTests(unittest.TestCase):
+    """Auto-migration off pre-dedup calibration.
+
+    A calibration file written before the content-block dedup fix holds
+    a `limit` derived from ~3.3x-inflated weighted totals and lacks the
+    `counts_deduped` marker. get_calibrated_limit must ignore that stale
+    limit (fall back to DEFAULT_LIMIT) so the install base migrates on
+    upgrade instead of flipping to under-prediction.
+    """
+
+    def test_pre_dedup_limit_is_ignored(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 64_000_000}, f)  # no counts_deduped marker
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            self.assertEqual(core.get_calibrated_limit(), core.DEFAULT_LIMIT)
+
+    def test_post_dedup_limit_is_trusted(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 28_000_000, "counts_deduped": True}, f)
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": tmp,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            self.assertEqual(core.get_calibrated_limit(), 28_000_000)
+
+    def test_record_observed_pct_stamps_marker(self):
+        """A fresh calibration writes counts_deduped=True so it is trusted
+        from then on."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "p")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "x", "s.jsonl"), [
+                usage_entry(time.time() - 60, input_=1000, request_id="req_A"),
+            ])
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": cf,
+            })
+            core.record_observed_pct(50)
+            self.assertTrue(core.load_calibration().get("counts_deduped"))
+
+    def test_stale_prior_not_blended_into_new_calibration(self):
+        """record_observed_pct must not EWMA-merge against a pre-dedup
+        (inflated) prior limit — it seeds fresh from the observation."""
+        with TemporaryDirectory() as tmp:
+            projects = os.path.join(tmp, "p")
+            os.makedirs(projects, exist_ok=True)
+            write_jsonl(os.path.join(projects, "x", "s.jsonl"), [
+                usage_entry(time.time() - 60, input_=2000, request_id="req_A"),
+            ])
+            cf = os.path.join(tmp, "c.json")
+            with open(cf, "w") as f:
+                json.dump({"limit": 10_000}, f)  # pre-dedup: no marker
+            core = reload_core({
+                "BUDGET_PROJECTS_DIR": projects,
+                "BUDGET_CALIBRATION_FILE": cf,
+                "BUDGET_EWMA_ALPHA": "0.5",
+            })
+            # observed 50% → observed_limit 4000. Stale prior 10000 is
+            # ignored → fresh seed 4000, not the EWMA blend (7000).
+            self.assertEqual(core.record_observed_pct(50), 4000)
 
 
 class MaybeUpdateCalibrationTests(unittest.TestCase):
@@ -605,6 +767,7 @@ class MaybeUpdateCalibrationTests(unittest.TestCase):
             with open(cf) as fh:
                 cal = json.load(fh)
             self.assertEqual(cal["limit"], expected)
+            self.assertTrue(cal["counts_deduped"])
             self.assertEqual(len(cal["history"]), 1)
             self.assertEqual(cal["history"][0]["kind"], "rate_limit_detected")
 
@@ -1172,6 +1335,250 @@ class ParseUsageTextTests(unittest.TestCase):
         cal = self._import()
         self.assertEqual(cal.parse_usage_text(""), (None, None))
         self.assertEqual(cal.parse_usage_text("hello world"), (None, None))
+
+
+class ParseResetToTsTests(unittest.TestCase):
+    """parse_reset_to_ts: a /usage 'Resets HH(:MM)(am|pm)' clue → the
+    Unix timestamp of the next occurrence of that wall-clock time, in
+    the machine's local time."""
+
+    def setUp(self):
+        self.core = reload_core({})
+
+    def test_midnight_resolves_to_next_local_midnight(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 12am (Asia/Seoul)", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 16, 0, 0, 0).timestamp(), delta=1)
+
+    def test_pm_time_today_when_still_ahead(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 11:30pm", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 15, 23, 30, 0).timestamp(), delta=1)
+
+    def test_time_already_passed_rolls_to_tomorrow(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 3:40am", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 16, 3, 40, 0).timestamp(), delta=1)
+
+    def test_noon(self):
+        now = datetime(2026, 5, 15, 6, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 12pm", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 15, 12, 0, 0).timestamp(), delta=1)
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(self.core.parse_reset_to_ts("Resets soon"))
+        self.assertIsNone(self.core.parse_reset_to_ts(""))
+        self.assertIsNone(self.core.parse_reset_to_ts(None))
+
+
+class SessionAnchorTests(unittest.TestCase):
+    """session_window_is_valid / save_session_anchor / get_session_anchor:
+    a /usage reset time is a trustworthy *current*-session end only when
+    it lands in (now, now+5h]."""
+
+    def test_window_end_in_range_is_valid(self):
+        core = reload_core({})
+        now = time.time()
+        self.assertTrue(core.session_window_is_valid(now + 3600, now))
+
+    def test_expired_window_end_is_invalid(self):
+        """A lagging /usage still showing the just-expired session → reject."""
+        core = reload_core({})
+        now = time.time()
+        self.assertFalse(core.session_window_is_valid(now - 600, now))
+
+    def test_far_future_window_end_is_invalid(self):
+        core = reload_core({})
+        now = time.time()
+        self.assertFalse(core.session_window_is_valid(now + 6 * 3600, now))
+
+    def test_save_and_get_roundtrip(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({"BUDGET_PROJECTS_DIR": tmp,
+                                "BUDGET_CALIBRATION_FILE": cf})
+            now = time.time()
+            we = now + 2 * 3600
+            self.assertTrue(core.save_session_anchor(we, now=now))
+            anchor = core.get_session_anchor()
+            self.assertIsNotNone(anchor)
+            ws, got_we = anchor
+            self.assertAlmostEqual(got_we, we, delta=1)
+            self.assertAlmostEqual(ws, we - 5 * 3600, delta=1)
+
+    def test_save_rejects_invalid_window_end(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({"BUDGET_PROJECTS_DIR": tmp,
+                                "BUDGET_CALIBRATION_FILE": cf})
+            now = time.time()
+            self.assertFalse(core.save_session_anchor(now - 600, now=now))
+            self.assertIsNone(core.get_session_anchor())
+
+
+class SessionCutoffTests(unittest.TestCase):
+    """scan_window anchors its cutoff to the real 5h session boundary.
+
+    A plain rolling now-5h window straddles a session reset — right after
+    a reset it keeps summing the previous, already-expired session. The
+    anchor (a /usage "Resets" time) lets scan_window count from the
+    session START instead."""
+
+    def _core(self, tmp, entries, cal_data=None, **env):
+        projects = os.path.join(tmp, "projects")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
+        cf = os.path.join(tmp, "c.json")
+        if cal_data is not None:
+            with open(cf, "w") as f:
+                json.dump(cal_data, f)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": cf,
+            **{k: str(v) for k, v in env.items()},
+        })
+
+    def test_anchor_excludes_previous_session(self):
+        """THE straddle fix: usage before window_start is not counted."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            ws = now - 3600                       # current session started 1h ago
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1_000_000, request_id="prev"),
+                usage_entry(now - 1800, input_=100, request_id="cur"),
+            ], cal_data={"session_window": {"window_start": ws,
+                                            "window_end": ws + 5 * 3600,
+                                            "anchored_at": now}})
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 100)          # previous-session 1M excluded
+            self.assertAlmostEqual(oldest, ws, delta=1)
+
+    def test_no_anchor_falls_back_to_rolling(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1000, request_id="a"),
+                usage_entry(now - 1800, input_=100, request_id="b"),
+            ])  # no calibration file → no anchor → rolling-5h
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 1100)
+
+    def test_disabled_via_env_uses_rolling(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            ws = now - 3600
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1000, request_id="a"),
+                usage_entry(now - 1800, input_=100, request_id="b"),
+            ], cal_data={"session_window": {"window_start": ws,
+                                            "window_end": ws + 5 * 3600,
+                                            "anchored_at": now}},
+               BUDGET_SESSION_ANCHOR="0")
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 1100)          # anchor ignored
+
+    def test_rollforward_across_expired_anchor(self):
+        """Anchor expired; cutoff rolls to the first activity after it."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we_old = now - 7200                   # previous session ended 2h ago
+            ws_old = we_old - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 4 * 3600, input_=1000, request_id="prev"),
+                usage_entry(now - 3600, input_=200, request_id="cur"),
+            ], cal_data={"session_window": {"window_start": ws_old,
+                                            "window_end": we_old,
+                                            "anchored_at": ws_old}})
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 200)
+            self.assertAlmostEqual(oldest, now - 3600, delta=1)
+
+    def test_gap_after_expiry_reports_zero(self):
+        """Anchor expired with no activity since → in a gap, 0 usage."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we_old = now - 3600
+            ws_old = we_old - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 2 * 3600, input_=5000, request_id="prev"),
+            ], cal_data={"session_window": {"window_start": ws_old,
+                                            "window_end": we_old,
+                                            "anchored_at": ws_old}})
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 0)
+
+
+class ShouldAnchorSessionTests(unittest.TestCase):
+    """should_anchor_session / note_anchor_dispatch / clear_anchor_retries:
+    fire auto_calibrate to (re-)capture a /usage anchor when the current
+    session has none, bounded by cooldown and a consecutive-retry cap."""
+
+    def _core(self, tmp, cal_data=None, **env):
+        cf = os.path.join(tmp, "c.json")
+        if cal_data is not None:
+            with open(cf, "w") as f:
+                json.dump(cal_data, f)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": tmp,
+            "BUDGET_CALIBRATION_FILE": cf,
+            "BUDGET_AUTO_CAL_COOLDOWN_SECS": "300",
+            **{k: str(v) for k, v in env.items()},
+        })
+
+    def test_no_anchor_fires(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp)
+            self.assertTrue(core.should_anchor_session(now=time.time()))
+
+    def test_current_session_anchored_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"session_window": {
+                "window_start": now - 3600, "window_end": now + 3600,
+                "anchored_at": now}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_expired_anchor_fires(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"session_window": {
+                "window_start": now - 7 * 3600, "window_end": now - 7200,
+                "anchored_at": now - 7 * 3600}})
+            self.assertTrue(core.should_anchor_session(now=now))
+
+    def test_cooldown_blocks(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"auto_cal_state": {
+                "last_dispatch_ts": now - 10}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_retry_cap_blocks(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"auto_cal_state": {
+                "anchor_retries": 3, "anchor_retry_ts": now - 60}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_disabled_via_env(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp, BUDGET_SESSION_ANCHOR="0")
+            self.assertFalse(core.should_anchor_session(now=time.time()))
+
+    def test_note_dispatch_increments_then_clear_resets(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp)
+            now = time.time()
+            core.note_anchor_dispatch(now=now)
+            st = core.load_calibration()["auto_cal_state"]
+            self.assertEqual(st["anchor_retries"], 1)
+            self.assertAlmostEqual(st["last_dispatch_ts"], now, delta=1)
+            core.note_anchor_dispatch(now=now + 1)
+            self.assertEqual(
+                core.load_calibration()["auto_cal_state"]["anchor_retries"], 2)
+            core.clear_anchor_retries()
+            self.assertEqual(
+                core.load_calibration()["auto_cal_state"]["anchor_retries"], 0)
 
 
 if __name__ == "__main__":
