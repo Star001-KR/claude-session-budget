@@ -25,6 +25,7 @@ from _budget_core import (
     THRESHOLD_SYNC, THRESHOLD_PAUSE, HOOK_PAUSE_MODE,
     HOOK_RECHECK_SECS, HOOK_RESET_GRACE_SECS, HOOK_MAX_SLEEP_SECS,
     should_fire_auto_calibrate, mark_milestone_fired, load_calibration,
+    should_anchor_session, note_anchor_dispatch,
 )
 
 
@@ -37,25 +38,29 @@ def current_status():
 
 
 def maybe_kick_auto_calibrate(pct, oldest):
-    """If a milestone is crossed, spawn auto_calibrate.py in the background.
+    """Spawn auto_calibrate.py in the background when a calibration is
+    warranted — either a usage milestone was crossed, or the current 5h
+    session still lacks a /usage window anchor.
 
-    Fire-and-forget: we mark the milestone fired *before* the spawn. That
-    dedupes *sequential* hook invocations — once one process persists the
-    milestone, later hooks load it and skip. It does NOT lock out *truly
-    concurrent* hook processes (e.g. parallel tool calls): if several read
-    calibration before any of them marks, each can still spawn its own
-    child. The cost is bounded — a milestone may over-fire by a few extra
-    `claude /usage` spawns per window; an exactly-once guarantee would need
-    a file lock. The child runs detached and writes its own log; we don't
-    wait for or read its output.
+    Fire-and-forget: the dispatch is marked *before* the spawn so
+    sequential hook invocations dedupe (once one process persists the
+    milestone / cooldown, later hooks load it and skip). Truly concurrent
+    hooks (parallel tool calls) may still each spawn a child; the cost is
+    bounded by milestone + cooldown gating. auto_calibrate captures the
+    session anchor *and* refines the limit on every run, so a single
+    spawn covers both reasons. The child runs detached with its own log.
     """
     cal = load_calibration()
     milestone = should_fire_auto_calibrate(pct, oldest, cal=cal)
-    if milestone is None:
+    if milestone is not None:
+        # Mark before spawn — dedupes sequential hook calls.
+        mark_milestone_fired(milestone, oldest, cal=cal)
+        reason = f"{milestone*100:.0f}% milestone"
+    elif should_anchor_session(cal=cal):
+        note_anchor_dispatch(cal=cal)
+        reason = "session-anchor refresh"
+    else:
         return
-    # Mark before spawn — dedupes sequential hook calls (see docstring;
-    # not a lock against truly concurrent hooks).
-    mark_milestone_fired(milestone, oldest, cal=cal)
 
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_calibrate.py")
     if not os.path.exists(script):
@@ -70,8 +75,7 @@ def maybe_kick_auto_calibrate(pct, oldest):
             start_new_session=True,  # detach from hook's process group
         )
         print(
-            f"[session-budget] auto-calibration triggered at "
-            f"{milestone*100:.0f}% milestone (background)",
+            f"[session-budget] auto-calibration triggered ({reason}, background)",
             file=sys.stderr,
         )
     except Exception as e:

@@ -41,6 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _budget_core import (
     record_observed_pct, scan_window, load_calibration, save_calibration,
     AUTO_CAL_ENABLED, auto_calibrate_supported,
+    parse_reset_to_ts, session_window_is_valid, save_session_anchor,
+    clear_anchor_retries,
 )
 from calibrate import parse_usage_text
 
@@ -310,10 +312,29 @@ def main():
         # spawn_claude_capture_usage already logged the detailed failure mode.
         return 1
 
+    now = time.time()  # refresh: the spawn above can take ~30s
     pct, reset = parse_usage_text(text)
     if pct is None:
         _log(f"parse failed; len(text)={len(text)} snippet={text[-400:]!r}")
         return 1
+
+    # Session-window anchor: convert /usage's "Resets" clue and store it so
+    # scan_window counts from the real session boundary, not a rolling
+    # now-5h window that straddles resets.
+    window_end = parse_reset_to_ts(reset, now=now)
+    if window_end is not None and not session_window_is_valid(window_end, now):
+        # /usage is lagging — still showing the just-expired session. Its
+        # pct is stale too, so don't calibrate the limit off it; the hook
+        # re-dispatches us once the cooldown elapses.
+        _log(f"/usage lagging: reset={reset!r} window_end={window_end:.0f} "
+             f"outside (now, now+5h] — skipping, will retry")
+        return 1
+    if window_end is not None:
+        save_session_anchor(window_end, now=now)
+        clear_anchor_retries()
+        _log(f"session anchor set: reset={reset!r} window_end={window_end:.0f}")
+    else:
+        _log(f"reset clue unparseable ({reset!r}) — limit calibration only, no anchor")
 
     weighted, oldest, _ = scan_window(now=now)
     if weighted == 0:

@@ -16,7 +16,7 @@ Claude Code enforces a **rolling 5-hour session limit**. When running automated 
 flowchart TD
     A([You run a task in Claude Code]) --> B[Claude Code logs API response<br/>to local JSONL]
     B --> C[budget_check.py hook<br/>fires before next tool call]
-    C --> D[scan_window:<br/>cutoff = now − 5h]
+    C --> D[scan_window:<br/>cutoff = session start]
     D --> F[Sum TTL-aware weighted tokens<br/>over all in-window jsonl entries]
     F --> G{Usage % vs<br/>calibrated limit}
     G -->|&lt; 80%| H([✓ Proceed<br/>logs % to stderr])
@@ -51,14 +51,13 @@ session start" anchor. That turned out to be wrong: Claude Code emits a
 not when the underlying 5h Max window begins. Real users open `claude` many
 times within one 5h window, so anchoring on the most recent `bridge_status`
 silently leapt the cutoff forward and reset the budget count to ~0%
-mid-window. We now use a plain rolling-5h cutoff and ignore `bridge_status`
-entirely.
+mid-window. `bridge_status` is ignored entirely.
 
-This means we cannot pinpoint the exact moment Anthropic's server-side 5h
-window started — the rolling-5h estimate is off by however much idle time
-preceded the earliest in-window jsonl message. In practice that's usually
-a few minutes; the fallback `oldest = earliest in-window usage ts` keeps
-the reset-time estimate within the same ballpark as `/usage`.
+The real session boundary instead comes from `/usage`: `auto_calibrate.py`
+parses its `Resets HH:MM` clue into a session-window anchor, and
+`scan_window` counts from the anchored session start (a plain rolling-5h
+cutoff is the fallback when no anchor is on file yet). See
+[`docs/internals.md`](docs/internals.md) → *Session-window anchoring*.
 
 ### Token Weighting (cost-equivalent, input = 1.0)
 
@@ -289,7 +288,7 @@ remaining string:
 {
   "pct": 13.2,
   "weighted_tokens": 2_128_235,
-  "calibrated_limit": 63_226_913,
+  "calibrated_limit": 30_000_000,
   "reset_at": 1778355198.018,        # epoch seconds (anchor + 5h, or oldest msg + 5h)
   "remaining_secs": 16_755,
   "remaining_str": "4h 39m",         # or "already reset" when remaining == 0
@@ -422,11 +421,9 @@ If `install.sh` ever fails mid-run, it backs up your previous
 
 - Token weights are a **proxy** — Anthropic's internal formula is not public
 - **Cross-device usage** is not tracked (JSONL files are local only)
-- **No exact server-side anchor**: we use a plain rolling-5h cutoff (see
-  [Why no `bridge_status` anchor?](#why-no-bridge_status-anchor)). The
-  reset-time estimate falls back to `earliest in-window usage ts + 5h`,
-  which lags the true server window start by however much idle time
-  preceded the first jsonl message
+- **Server anchor needs a `/usage` read**: the session boundary comes from
+  `/usage` (captured by `auto_calibrate.py`); until the current session has
+  been anchored, `scan_window` falls back to a rolling-5h cutoff
 - The rate-limit `api_error` signature is **conservative** — accepts both
   `status=429` and any inner `error.type` containing `rate_limit`/`usage_limit`.
   The structural shape has been validated against real `status=401`/`502`
@@ -448,7 +445,7 @@ If `install.sh` ever fails mid-run, it backs up your previous
 | `scripts/session_budget_manager.py` | Full async class for PM/orchestrator integration |
 | `scripts/calibrate.py` | Manual calibration entry from a `/usage` reading |
 | `scripts/_budget_core.py` | Shared core: `.env` loader, JSONL scan, anchor detection, signature matcher, EWMA learner |
-| `tests/test_budget_core.py` | Unit tests (86) — env loading, jsonl scan, signature matcher, EWMA, TTL-aware weighting, auto-calibration trigger, /usage parser |
+| `tests/test_budget_core.py` | Unit tests (117) — env loading, jsonl scan, content-block dedup, session-window anchoring, signature matcher, EWMA, TTL-aware weighting, auto-calibration trigger, /usage parser |
 | `.env.example` | Copy to `./.env` or `~/.claude/.env` |
 | `install.sh` | One-line installer for the manual (non-plugin) hook setup |
 | `Formula/claude-session-budget.rb` | Homebrew formula (used when this repo is added as a brew tap) |

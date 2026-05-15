@@ -43,6 +43,7 @@ def reload_core(env_overrides):
         "BUDGET_AUTO_CAL_MILESTONES",
         "BUDGET_AUTO_CAL_COOLDOWN_SECS",
         "BUDGET_AUTO_CALIBRATE_RUNNING",
+        "BUDGET_SESSION_ANCHOR",
     ]
     for k in keys:
         os.environ.pop(k, None)
@@ -1334,6 +1335,250 @@ class ParseUsageTextTests(unittest.TestCase):
         cal = self._import()
         self.assertEqual(cal.parse_usage_text(""), (None, None))
         self.assertEqual(cal.parse_usage_text("hello world"), (None, None))
+
+
+class ParseResetToTsTests(unittest.TestCase):
+    """parse_reset_to_ts: a /usage 'Resets HH(:MM)(am|pm)' clue → the
+    Unix timestamp of the next occurrence of that wall-clock time, in
+    the machine's local time."""
+
+    def setUp(self):
+        self.core = reload_core({})
+
+    def test_midnight_resolves_to_next_local_midnight(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 12am (Asia/Seoul)", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 16, 0, 0, 0).timestamp(), delta=1)
+
+    def test_pm_time_today_when_still_ahead(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 11:30pm", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 15, 23, 30, 0).timestamp(), delta=1)
+
+    def test_time_already_passed_rolls_to_tomorrow(self):
+        now = datetime(2026, 5, 15, 19, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 3:40am", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 16, 3, 40, 0).timestamp(), delta=1)
+
+    def test_noon(self):
+        now = datetime(2026, 5, 15, 6, 0, 0).timestamp()
+        ts = self.core.parse_reset_to_ts("Resets 12pm", now=now)
+        self.assertAlmostEqual(ts, datetime(2026, 5, 15, 12, 0, 0).timestamp(), delta=1)
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(self.core.parse_reset_to_ts("Resets soon"))
+        self.assertIsNone(self.core.parse_reset_to_ts(""))
+        self.assertIsNone(self.core.parse_reset_to_ts(None))
+
+
+class SessionAnchorTests(unittest.TestCase):
+    """session_window_is_valid / save_session_anchor / get_session_anchor:
+    a /usage reset time is a trustworthy *current*-session end only when
+    it lands in (now, now+5h]."""
+
+    def test_window_end_in_range_is_valid(self):
+        core = reload_core({})
+        now = time.time()
+        self.assertTrue(core.session_window_is_valid(now + 3600, now))
+
+    def test_expired_window_end_is_invalid(self):
+        """A lagging /usage still showing the just-expired session → reject."""
+        core = reload_core({})
+        now = time.time()
+        self.assertFalse(core.session_window_is_valid(now - 600, now))
+
+    def test_far_future_window_end_is_invalid(self):
+        core = reload_core({})
+        now = time.time()
+        self.assertFalse(core.session_window_is_valid(now + 6 * 3600, now))
+
+    def test_save_and_get_roundtrip(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({"BUDGET_PROJECTS_DIR": tmp,
+                                "BUDGET_CALIBRATION_FILE": cf})
+            now = time.time()
+            we = now + 2 * 3600
+            self.assertTrue(core.save_session_anchor(we, now=now))
+            anchor = core.get_session_anchor()
+            self.assertIsNotNone(anchor)
+            ws, got_we = anchor
+            self.assertAlmostEqual(got_we, we, delta=1)
+            self.assertAlmostEqual(ws, we - 5 * 3600, delta=1)
+
+    def test_save_rejects_invalid_window_end(self):
+        with TemporaryDirectory() as tmp:
+            cf = os.path.join(tmp, "c.json")
+            core = reload_core({"BUDGET_PROJECTS_DIR": tmp,
+                                "BUDGET_CALIBRATION_FILE": cf})
+            now = time.time()
+            self.assertFalse(core.save_session_anchor(now - 600, now=now))
+            self.assertIsNone(core.get_session_anchor())
+
+
+class SessionCutoffTests(unittest.TestCase):
+    """scan_window anchors its cutoff to the real 5h session boundary.
+
+    A plain rolling now-5h window straddles a session reset — right after
+    a reset it keeps summing the previous, already-expired session. The
+    anchor (a /usage "Resets" time) lets scan_window count from the
+    session START instead."""
+
+    def _core(self, tmp, entries, cal_data=None, **env):
+        projects = os.path.join(tmp, "projects")
+        os.makedirs(projects, exist_ok=True)
+        write_jsonl(os.path.join(projects, "p", "s.jsonl"), entries)
+        cf = os.path.join(tmp, "c.json")
+        if cal_data is not None:
+            with open(cf, "w") as f:
+                json.dump(cal_data, f)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": cf,
+            **{k: str(v) for k, v in env.items()},
+        })
+
+    def test_anchor_excludes_previous_session(self):
+        """THE straddle fix: usage before window_start is not counted."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            ws = now - 3600                       # current session started 1h ago
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1_000_000, request_id="prev"),
+                usage_entry(now - 1800, input_=100, request_id="cur"),
+            ], cal_data={"session_window": {"window_start": ws,
+                                            "window_end": ws + 5 * 3600,
+                                            "anchored_at": now}})
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 100)          # previous-session 1M excluded
+            self.assertAlmostEqual(oldest, ws, delta=1)
+
+    def test_no_anchor_falls_back_to_rolling(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1000, request_id="a"),
+                usage_entry(now - 1800, input_=100, request_id="b"),
+            ])  # no calibration file → no anchor → rolling-5h
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 1100)
+
+    def test_disabled_via_env_uses_rolling(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            ws = now - 3600
+            core = self._core(tmp, [
+                usage_entry(now - 9000, input_=1000, request_id="a"),
+                usage_entry(now - 1800, input_=100, request_id="b"),
+            ], cal_data={"session_window": {"window_start": ws,
+                                            "window_end": ws + 5 * 3600,
+                                            "anchored_at": now}},
+               BUDGET_SESSION_ANCHOR="0")
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 1100)          # anchor ignored
+
+    def test_rollforward_across_expired_anchor(self):
+        """Anchor expired; cutoff rolls to the first activity after it."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we_old = now - 7200                   # previous session ended 2h ago
+            ws_old = we_old - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 4 * 3600, input_=1000, request_id="prev"),
+                usage_entry(now - 3600, input_=200, request_id="cur"),
+            ], cal_data={"session_window": {"window_start": ws_old,
+                                            "window_end": we_old,
+                                            "anchored_at": ws_old}})
+            total, oldest, _ = core.scan_window(now=now)
+            self.assertEqual(total, 200)
+            self.assertAlmostEqual(oldest, now - 3600, delta=1)
+
+    def test_gap_after_expiry_reports_zero(self):
+        """Anchor expired with no activity since → in a gap, 0 usage."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            we_old = now - 3600
+            ws_old = we_old - 5 * 3600
+            core = self._core(tmp, [
+                usage_entry(now - 2 * 3600, input_=5000, request_id="prev"),
+            ], cal_data={"session_window": {"window_start": ws_old,
+                                            "window_end": we_old,
+                                            "anchored_at": ws_old}})
+            total, _, _ = core.scan_window(now=now)
+            self.assertEqual(total, 0)
+
+
+class ShouldAnchorSessionTests(unittest.TestCase):
+    """should_anchor_session / note_anchor_dispatch / clear_anchor_retries:
+    fire auto_calibrate to (re-)capture a /usage anchor when the current
+    session has none, bounded by cooldown and a consecutive-retry cap."""
+
+    def _core(self, tmp, cal_data=None, **env):
+        cf = os.path.join(tmp, "c.json")
+        if cal_data is not None:
+            with open(cf, "w") as f:
+                json.dump(cal_data, f)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": tmp,
+            "BUDGET_CALIBRATION_FILE": cf,
+            "BUDGET_AUTO_CAL_COOLDOWN_SECS": "300",
+            **{k: str(v) for k, v in env.items()},
+        })
+
+    def test_no_anchor_fires(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp)
+            self.assertTrue(core.should_anchor_session(now=time.time()))
+
+    def test_current_session_anchored_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"session_window": {
+                "window_start": now - 3600, "window_end": now + 3600,
+                "anchored_at": now}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_expired_anchor_fires(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"session_window": {
+                "window_start": now - 7 * 3600, "window_end": now - 7200,
+                "anchored_at": now - 7 * 3600}})
+            self.assertTrue(core.should_anchor_session(now=now))
+
+    def test_cooldown_blocks(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"auto_cal_state": {
+                "last_dispatch_ts": now - 10}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_retry_cap_blocks(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data={"auto_cal_state": {
+                "anchor_retries": 3, "anchor_retry_ts": now - 60}})
+            self.assertFalse(core.should_anchor_session(now=now))
+
+    def test_disabled_via_env(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp, BUDGET_SESSION_ANCHOR="0")
+            self.assertFalse(core.should_anchor_session(now=time.time()))
+
+    def test_note_dispatch_increments_then_clear_resets(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp)
+            now = time.time()
+            core.note_anchor_dispatch(now=now)
+            st = core.load_calibration()["auto_cal_state"]
+            self.assertEqual(st["anchor_retries"], 1)
+            self.assertAlmostEqual(st["last_dispatch_ts"], now, delta=1)
+            core.note_anchor_dispatch(now=now + 1)
+            self.assertEqual(
+                core.load_calibration()["auto_cal_state"]["anchor_retries"], 2)
+            core.clear_anchor_retries()
+            self.assertEqual(
+                core.load_calibration()["auto_cal_state"]["anchor_retries"], 0)
 
 
 if __name__ == "__main__":
