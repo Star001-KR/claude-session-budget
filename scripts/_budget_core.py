@@ -8,7 +8,7 @@ Responsibilities:
   - Persist auto-learned calibration to ~/.claude/.budget_calibration.json.
   - Detect rate-limit events in JSONL and EWMA-update the calibrated limit.
 """
-import glob, json, os, re, tempfile, time, traceback
+import glob, json, os, re, subprocess, sys, tempfile, time, traceback
 from datetime import datetime, timedelta
 
 WINDOW_SECS = 5 * 3600
@@ -409,6 +409,56 @@ def clear_anchor_retries(cal=None):
         state["anchor_retries"] = 0
         cal["auto_cal_state"] = state
         save_calibration(cal)
+
+
+def maybe_kick_auto_calibrate(pct, oldest):
+    """Spawn auto_calibrate.py in the background when a calibration is
+    warranted — either a usage milestone was crossed, or the current 5h
+    session still lacks a /usage window anchor. Returns a short reason
+    string when a child was spawned, else None.
+
+    Shared by the budget_check PreToolUse hook and SessionBudgetManager:
+    a hook-driven install fires this from the hook, but an orchestrator
+    that drives SessionBudgetManager directly never runs the hook — so
+    without a shared kicker it would never self-calibrate.
+
+    Fire-and-forget: the dispatch is marked *before* the spawn so
+    sequential callers dedupe (once one process persists the milestone /
+    cooldown, later callers load it and skip). Truly concurrent callers
+    (parallel tool calls) may still each spawn a child; the cost is
+    bounded by milestone + cooldown gating. auto_calibrate captures the
+    session anchor *and* refines the limit on every run, so a single
+    spawn covers both reasons. The child runs detached with its own log.
+    """
+    cal = load_calibration()
+    milestone = should_fire_auto_calibrate(pct, oldest, cal=cal)
+    if milestone is not None:
+        # Mark before spawn — dedupes sequential calls.
+        mark_milestone_fired(milestone, oldest, cal=cal)
+        reason = f"{milestone*100:.0f}% milestone"
+    elif should_anchor_session(cal=cal):
+        note_anchor_dispatch(cal=cal)
+        reason = "session-anchor refresh"
+    else:
+        return None
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_calibrate.py")
+    if not os.path.exists(script):
+        return None
+    try:
+        subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,  # detach from the caller's process group
+        )
+        return reason
+    except Exception as e:
+        # Never let an auto-cal spawn failure break the caller.
+        _log_swallowed(e, "maybe_kick_auto_calibrate spawn")
+        return None
 
 
 def get_weights():

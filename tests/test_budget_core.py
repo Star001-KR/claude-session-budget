@@ -1613,5 +1613,114 @@ class ShouldAnchorSessionTests(unittest.TestCase):
                 core.load_calibration()["auto_cal_state"]["anchor_retries"], 0)
 
 
+class _PopenRecorder:
+    """Drop-in for the `subprocess` module used by maybe_kick_auto_calibrate:
+    records Popen argv/kwargs instead of forking, and can be told to raise so
+    the swallowed-failure path is exercised. `DEVNULL` is referenced by the
+    function under test; its value is irrelevant to a recorder."""
+
+    DEVNULL = None
+
+    def __init__(self, raises=False):
+        self.calls = []
+        self._raises = raises
+
+    def Popen(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        if self._raises:
+            raise OSError("simulated spawn failure")
+        return object()
+
+
+class MaybeKickAutoCalibrateTests(unittest.TestCase):
+    """maybe_kick_auto_calibrate: the shared trigger that spawns
+    auto_calibrate.py in the background. Moved into _budget_core (from the
+    budget_check hook) so SessionBudgetManager can fire it too — a headless
+    orchestrator then self-calibrates without the PreToolUse hook. The
+    `subprocess` module is swapped for a recorder so no child is forked."""
+
+    def _core(self, tmp, cal_data=None, **env):
+        cf = os.path.join(tmp, "c.json")
+        if cal_data is not None:
+            with open(cf, "w") as f:
+                json.dump(cal_data, f)
+        return reload_core({
+            "BUDGET_PROJECTS_DIR": tmp,
+            "BUDGET_CALIBRATION_FILE": cf,
+            "BUDGET_AUTO_CAL_COOLDOWN_SECS": "0",
+            **{k: str(v) for k, v in env.items()},
+        })
+
+    def _valid_anchor(self, now):
+        """A session_window payload whose anchor covers `now`, so
+        should_anchor_session() is False and only the milestone path fires."""
+        return {"session_window": {"window_start": now - 3600,
+                                   "window_end": now + 3600,
+                                   "anchored_at": now}}
+
+    def test_milestone_crossing_spawns_and_returns_reason(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data=self._valid_anchor(now))
+            rec = _PopenRecorder()
+            core.subprocess = rec
+            reason = core.maybe_kick_auto_calibrate(0.95, now - 1800)
+            self.assertEqual(reason, "90% milestone")
+            self.assertEqual(len(rec.calls), 1)
+            argv, _ = rec.calls[0]
+            self.assertEqual(argv[0], sys.executable)
+            self.assertTrue(argv[1].endswith("auto_calibrate.py"))
+
+    def test_missing_anchor_triggers_anchor_refresh(self):
+        with TemporaryDirectory() as tmp:
+            core = self._core(tmp)  # no cal file → no anchor on record
+            rec = _PopenRecorder()
+            core.subprocess = rec
+            # pct below every milestone → only the anchor path can fire
+            reason = core.maybe_kick_auto_calibrate(0.10, time.time() - 1800)
+            self.assertEqual(reason, "session-anchor refresh")
+            self.assertEqual(len(rec.calls), 1)
+
+    def test_nothing_warranted_returns_none_without_spawn(self):
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data=self._valid_anchor(now))
+            rec = _PopenRecorder()
+            core.subprocess = rec
+            # below milestone AND a valid anchor already on file
+            reason = core.maybe_kick_auto_calibrate(0.50, now - 1800)
+            self.assertIsNone(reason)
+            self.assertEqual(rec.calls, [])
+
+    def test_milestone_marked_before_spawn_dedupes(self):
+        """The milestone is persisted before the spawn, so a second call in
+        the same window finds it fired and does not dispatch again."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data=self._valid_anchor(now))
+            rec = _PopenRecorder()
+            core.subprocess = rec
+            oldest = now - 1800
+            first = core.maybe_kick_auto_calibrate(0.95, oldest)
+            second = core.maybe_kick_auto_calibrate(0.95, oldest)
+            self.assertEqual(first, "90% milestone")
+            self.assertIsNone(second)
+            self.assertEqual(len(rec.calls), 1)
+
+    def test_spawn_failure_is_swallowed_and_logged(self):
+        """A failed Popen must return None (never crash the caller) and
+        leave a traceback in the error log."""
+        with TemporaryDirectory() as tmp:
+            now = time.time()
+            core = self._core(tmp, cal_data=self._valid_anchor(now))
+            core.subprocess = _PopenRecorder(raises=True)
+            log = os.path.join(tmp, "err.log")
+            core.ERROR_LOG_PATH = log
+            reason = core.maybe_kick_auto_calibrate(0.95, now - 1800)
+            self.assertIsNone(reason)
+            with open(log) as f:
+                self.assertIn("maybe_kick_auto_calibrate spawn", f.read())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

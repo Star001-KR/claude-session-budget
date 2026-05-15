@@ -29,10 +29,15 @@ _ENV_KEYS = [
 
 def reload_sbm(env_overrides):
     """Reload _budget_core then session_budget_manager with env applied, so
-    the manager picks up the freshly-configured core functions."""
+    the manager picks up the freshly-configured core functions.
+
+    BUDGET_AUTO_CAL_ENABLED defaults to "0" here: _snapshot() now kicks
+    maybe_kick_auto_calibrate, which would fork a real auto_calibrate.py
+    child during an ordinary manager test. The dedicated auto-cal test
+    monkeypatches the function instead, so it never needs it enabled."""
     for k in _ENV_KEYS:
         os.environ.pop(k, None)
-    for k, v in env_overrides.items():
+    for k, v in {"BUDGET_AUTO_CAL_ENABLED": "0", **env_overrides}.items():
         os.environ[k] = str(v)
     import _budget_core
     importlib.reload(_budget_core)
@@ -168,6 +173,51 @@ class ZeroUsageStatusTests(unittest.TestCase):
             self.assertEqual(s["pct"], 0.0)
             self.assertIsNone(s["reset_at"])
             self.assertEqual(s["remaining_str"], "n/a")
+
+
+class SnapshotAutoCalibrateTests(unittest.TestCase):
+    """#2 — _snapshot() kicks maybe_kick_auto_calibrate so a headless
+    SessionBudgetManager caller self-calibrates without the PreToolUse
+    hook. Skipped when the caller pins an explicit limit (it then owns
+    calibration). maybe_kick_auto_calibrate is monkeypatched so no real
+    auto_calibrate.py child is forked."""
+
+    def _empty(self, tmp):
+        projects = os.path.join(tmp, "projects")
+        os.makedirs(projects, exist_ok=True)
+        return reload_sbm({
+            "BUDGET_PROJECTS_DIR": projects,
+            "BUDGET_CALIBRATION_FILE": os.path.join(tmp, "c.json"),
+        })
+
+    def test_snapshot_kicks_auto_calibrate(self):
+        with TemporaryDirectory() as tmp:
+            sbm = self._empty(tmp)
+            calls, real = [], sbm.maybe_kick_auto_calibrate
+
+            def recording(pct, oldest):
+                calls.append((pct, oldest))
+                return None
+
+            sbm.maybe_kick_auto_calibrate = recording
+            try:
+                sbm.SessionBudgetManager().get_status()
+            finally:
+                sbm.maybe_kick_auto_calibrate = real
+            self.assertEqual(len(calls), 1)        # one snapshot → one kick
+
+    def test_explicit_limit_skips_auto_calibrate(self):
+        """An explicit calibrated_limit means the caller owns calibration —
+        _snapshot must leave auto-cal alone (mirrors maybe_update_calibration)."""
+        with TemporaryDirectory() as tmp:
+            sbm = self._empty(tmp)
+            calls, real = [], sbm.maybe_kick_auto_calibrate
+            sbm.maybe_kick_auto_calibrate = lambda *a, **k: calls.append(1)
+            try:
+                sbm.SessionBudgetManager(calibrated_limit=30_000_000).get_status()
+            finally:
+                sbm.maybe_kick_auto_calibrate = real
+            self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

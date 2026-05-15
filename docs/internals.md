@@ -95,12 +95,18 @@ The fix anchors the cutoff to the real boundary:
   fallback.
 - No anchor on file (or `BUDGET_SESSION_ANCHOR=0`) → rolling-5h fallback.
 
-**Capturing the anchor.** The hook fires `auto_calibrate.py` when the
-current session has no valid anchor (`should_anchor_session()`), gated by
-the auto-cal cooldown. A `/usage` read can lag — right after a reset it
-may still show the just-expired session. `session_window_is_valid()`
-rejects any `window_end` outside `(now, now+5h]`; a rejected read is not
-stored, and the hook re-dispatches after the cooldown (bounded by a
+**Capturing the anchor.** [`maybe_kick_auto_calibrate()`](../scripts/_budget_core.py)
+spawns `auto_calibrate.py` in the background when a calibration is
+warranted — a usage milestone was crossed (`should_fire_auto_calibrate()`)
+or the current session has no valid anchor (`should_anchor_session()`) —
+gated by the auto-cal cooldown. It is the **shared trigger**: the
+`budget_check` PreToolUse hook calls it on every fire, and
+`SessionBudgetManager._snapshot()` calls it on every status read, so an
+orchestrator that drives the manager directly self-calibrates without the
+hook installed. A `/usage` read can lag — right after a reset it may
+still show the just-expired session. `session_window_is_valid()` rejects
+any `window_end` outside `(now, now+5h]`; a rejected read is not stored,
+and the caller re-dispatches after the cooldown (bounded by a
 consecutive-retry cap).
 
 ### Why no `bridge_status` anchor
@@ -284,7 +290,7 @@ running `budget_check.py` 100 times against the same event learns it once.
 | jsonl line is malformed | skipped silently |
 | jsonl file mtime > 5h old | skipped (mtime optimization) |
 | No `/usage` session anchor on file | `scan_window` falls back to a plain rolling-5h cutoff |
-| `/usage` read lags (shows expired session) | `window_end` rejected, not stored; hook re-dispatches after cooldown |
+| `/usage` read lags (shows expired session) | `window_end` rejected, not stored; re-dispatched after cooldown |
 | No api_error events ever | `limit` stays at `DEFAULT_LIMIT` (30M) |
 | Pre-dedup calibration file (no `counts_deduped`) | stale `limit` ignored → `DEFAULT_LIMIT` until re-calibrated |
 | `~/.claude/.budget_calibration.json` corrupt | treated as empty, recreated on next save |
@@ -292,10 +298,11 @@ running `budget_check.py` 100 times against the same event learns it once.
 
 ## Testing
 
-The suite lives in [`tests/`](../tests) — 125 tests: `test_budget_core.py`
-(119, the classes below) and `test_session_budget_manager.py` (6 —
-`check_and_status()` single-scan, `get_status()` zero-usage reset handling).
-Each `test_budget_core.py` class:
+The suite lives in [`tests/`](../tests) — 132 tests: `test_budget_core.py`
+(124, the classes below) and `test_session_budget_manager.py` (8 —
+`check_and_status()` single-scan, `get_status()` zero-usage reset
+handling, `_snapshot()` auto-calibration kick). Each `test_budget_core.py`
+class:
 
 - `LoadEnvFileTests` — env loader semantics (incl. opt-in cwd `.env`)
 - `ParseTsTests` — timestamp parsing edge cases
@@ -318,6 +325,9 @@ Each `test_budget_core.py` class:
 - `ThresholdConstantsTests` — env-var binding incl. sleep-mode constants
 - `AutoCalibrateTriggerTests` — milestone gating, cooldown, window-key
   rollover for `should_fire_auto_calibrate()`
+- `MaybeKickAutoCalibrateTests` — the shared `maybe_kick_auto_calibrate()`
+  trigger: milestone vs anchor-refresh reason, mark-before-spawn dedup,
+  swallowed spawn failure
 - `ParseUsageTextTests` — `/usage` panel scraping (ANSI strip, multi-row
   panel, missing-section tolerance)
 
